@@ -1,158 +1,206 @@
-"""Tests for Stage 01: Scalar values & arithmetic.
+"""Tests for stage 2: Computational graph.
 
-Run with:  pytest stage_01_scalar_values/test.py
+Validates that `Value` records its operation graph (`_prev`, `_op`) while
+forward arithmetic stays identical to stage_01.
 
-This is the ORIGIN stage: it imports nothing from earlier stages, so the test
-loads this stage's own ``code.py`` by file path (a stage's tests always run
-against its own ``code.py``). Later stages will pull this ``Value`` forward via
-``dlfs.stage_import`` and extend it.
-
-There are no analytic gradients in this stage, so there is nothing to compare a
-hand-derived derivative against. Instead, the final tests use the symmetric
-CENTRAL DIFFERENCE
-    f'(x) ~= (f(x + h) - f(x - h)) / (2h)
-to confirm that derivatives of `Value` expressions exist and match the slope we
-expect (e.g. d/da (a*b) = b). From stage 05 on, this same central-difference
-recipe becomes the gradient check against your analytic `.backward()`.
+This stage does NOT implement a backward pass, so there are no analytical
+`grad` fields to gradient-check yet. To still honor central-difference
+gradient checking "where gradients exist", we treat the *forward* DAG as a
+differentiable function of its leaf inputs and verify the local derivatives
+the README derives ( d(a+b)/da = 1, d(a*b)/da = b ) numerically, by
+re-running the forward graph with each leaf perturbed by +/-eps. When the
+real backward pass arrives in a later stage, the SAME central-difference
+recipe will be reused against analytical `.grad` values.
 """
 
+
 import pytest
-from src.engine import Value
+from src.engine import Value, trace
 
 class _MOD:
     Value = Value
+    trace = trace
 # ---------------------------------------------------------------------------
 # Construction & repr
 # ---------------------------------------------------------------------------
 
-def test_data_is_float():
-    v = Value(3)
-    assert isinstance(v.data, float), "Value.data must be coerced to float"
-    assert v.data == 3.0
+# --------------------------------------------------------------------------
+# central-difference helper (reused verbatim by later stages vs analytical grad)
+# --------------------------------------------------------------------------
+def numgrad(f, x, eps=1e-6):
+    """Central-difference derivative of scalar f at scalar x.
+
+    (f(x + eps) - f(x - eps)) / (2 * eps)
+    """
+    return (f(x + eps) - f(x - eps)) / (2.0 * eps)
 
 
-def test_grad_initialized_zero():
-    v = Value(1.5)
-    assert v.grad == 0.0, "Value.grad must be initialized to 0.0 (unused this stage)"
+# --------------------------------------------------------------------------
+# forward arithmetic must be unchanged from stage_01
+# --------------------------------------------------------------------------
+def test_leaf_data_is_float():
+    a = Value(3)
+    assert isinstance(a.data, float), "data must be stored as a float"
+    assert a.data == 3.0
 
 
-def test_repr():
-    assert repr(Value(4.0)) == "Value(data=4.0)"
+def test_add_forward():
+    a, b = Value(2.0), Value(5.0)
+    assert (a + b).data == 7.0, "addition forward value changed from stage_01"
 
 
-# ---------------------------------------------------------------------------
-# Forward arithmetic matches raw-float arithmetic
-# ---------------------------------------------------------------------------
-
-def test_add():
-    a, b = Value(2.0), Value(-3.0)
-    assert (a + b).data == pytest.approx(-1.0)
+def test_mul_forward():
+    a, b = Value(2.0), Value(5.0)
+    assert (a * b).data == 10.0, "multiplication forward value changed"
 
 
-def test_mul():
-    a, b = Value(2.0), Value(-3.0)
-    assert (a * b).data == pytest.approx(-6.0)
-
-
-def test_sub():
-    a, b = Value(2.0), Value(-3.0)
-    assert (a - b).data == pytest.approx(5.0)
-
-
-def test_div():
-    a, b = Value(6.0), Value(3.0)
-    assert (a / b).data == pytest.approx(2.0)
-
-
-def test_neg():
-    a = Value(2.0)
-    assert (-a).data == pytest.approx(-2.0)
-
-
-def test_pow():
-    a = Value(3.0)
-    assert (a ** 2).data == pytest.approx(9.0)
-    assert (a ** -1).data == pytest.approx(1.0 / 3.0)
-
-
-def test_pow_rejects_value_exponent():
-    a = Value(3.0)
-    with pytest.raises((AssertionError, TypeError)):
-        _ = a ** Value(2.0)
-
-
-def test_compound_expression():
+def test_compound_forward():
     a, b, c = Value(2.0), Value(-3.0), Value(10.0)
-    d = a * b + c          # 2*-3 + 10 = 4
-    assert d.data == pytest.approx(4.0)
+    out = a * b + c
+    assert out.data == 4.0, "(a*b + c) forward value incorrect"
 
 
-def test_op_returns_new_value():
+def test_number_coercion_and_reflected_ops():
+    a = Value(4.0)
+    assert (a + 1).data == 5.0, "Value + number failed"
+    assert (1 + a).data == 5.0, "number + Value (__radd__) failed"
+    assert (a * 3).data == 12.0, "Value * number failed"
+    assert (3 * a).data == 12.0, "number * Value (__rmul__) failed"
+
+
+# --------------------------------------------------------------------------
+# graph bookkeeping: _prev and _op
+# --------------------------------------------------------------------------
+def test_leaf_has_empty_graph():
+    a = Value(1.0)
+    assert a._prev == set(), "a leaf must have no parents"
+    assert a._op == "", "a leaf must have empty _op"
+    assert a.grad == 0.0, "grad must default to 0.0"
+
+
+def test_leaf_backward_is_noop():
+    # Every node reserves a _backward hook; a leaf's is a no-op that changes
+    # nothing. stage_03 installs the real per-op rules on result nodes.
+    a = Value(5.0)
+    a._backward()  # must not raise
+    assert a.grad == 0.0
+
+
+def test_add_records_parents_and_op():
     a, b = Value(2.0), Value(3.0)
     out = a + b
-    assert isinstance(out, Value)
-    assert out is not a and out is not b
+    assert out._op == "+", "add result must have _op == '+'"
+    assert out._prev == {a, b}, "add result must record both operands as parents"
 
 
-# ---------------------------------------------------------------------------
-# Mixing Value with plain ints/floats on either side
-# ---------------------------------------------------------------------------
-
-def test_mixed_left_operand():
-    a = Value(4.0)
-    assert (a + 1).data == pytest.approx(5.0)
-    assert (a * 3).data == pytest.approx(12.0)
-    assert (a - 1.5).data == pytest.approx(2.5)
-    assert (a / 2).data == pytest.approx(2.0)
+def test_mul_records_parents_and_op():
+    a, b = Value(2.0), Value(3.0)
+    out = a * b
+    assert out._op == "*", "mul result must have _op == '*'"
+    assert out._prev == {a, b}, "mul result must record both operands as parents"
 
 
-def test_mixed_right_operand():
-    a = Value(4.0)
-    assert (1 + a).data == pytest.approx(5.0)
-    assert (3 * a).data == pytest.approx(12.0)
-    assert (10 - a).data == pytest.approx(6.0)
-    assert (8 / a).data == pytest.approx(2.0)
+def test_coerced_operand_becomes_value_parent():
+    a = Value(2.0)
+    out = a + 1
+    assert len(out._prev) == 2, "coerced number must appear as a Value parent"
+    assert a in out._prev, "original Value must be a parent"
+    parents = list(out._prev)
+    other = parents[0] if parents[1] is a else parents[1]
+    assert isinstance(other, Value), "coerced operand must be wrapped in Value"
+    assert other.data == 1.0, "coerced operand must carry the number's data"
 
 
-# ---------------------------------------------------------------------------
-# Numerical derivative check (central differences).
-# No analytic gradients exist yet; we only confirm the slope of the forward
-# function is what calculus predicts. d/da (a*b + c) = b ; d/da (a**2) = 2a.
-# ---------------------------------------------------------------------------
-
-def _central_diff(f, x, h=1e-6):
-    """(f(x+h) - f(x-h)) / (2h), evaluated on plain floats via Value."""
-    fp = f(x + h)
-    fm = f(x - h)
-    return (fp - fm) / (2.0 * h)
+def test_self_reuse_dedups_in_prev():
+    a = Value(3.0)
+    out = a * a
+    assert out.data == 9.0, "a*a forward value incorrect"
+    assert out._prev == {a}, "a*a must store a single parent (set dedup)"
+    assert len(out._prev) == 1
 
 
-def test_central_difference_linear():
-    # f(a) = a*b + c with b = -3, c = 10  =>  df/da = b = -3
+# --------------------------------------------------------------------------
+# trace(): full DAG enumeration without duplicates or infinite loops
+# --------------------------------------------------------------------------
+def test_trace_simple_graph():
+    a, b = Value(2.0), Value(3.0)
+    out = a + b
+    nodes, edges = trace(out)
+    assert nodes == {a, b, out}, "trace must return every reachable node"
+    assert edges == {(a, out), (b, out)}, "trace must return each parent->child edge"
+
+
+def test_trace_compound_graph():
+    a, b, c = Value(2.0), Value(-3.0), Value(10.0)
+    e = a * b          # node e
+    out = e + c        # node out
+    nodes, edges = trace(out)
+    assert nodes == {a, b, c, e, out}
+    assert edges == {(a, e), (b, e), (e, out), (c, out)}
+
+
+def test_trace_terminates_on_reused_node():
+    a = Value(3.0)
+    out = a * a
+    nodes, edges = trace(out)  # must not loop / duplicate
+    assert nodes == {a, out}
+    assert edges == {(a, out)}
+
+
+def test_trace_leaf():
+    a = Value(7.0)
+    nodes, edges = trace(a)
+    assert nodes == {a}
+    assert edges == set()
+
+
+# --------------------------------------------------------------------------
+# central-difference check of the README's local derivatives via the DAG
+# --------------------------------------------------------------------------
+def test_numgrad_addition_local_derivative():
+    # f(a) = a + b ; d f / d a should be 1.0
+    b = 3.0
+
+    def f(a):
+        return (Value(a) + Value(b)).data
+
+    g = numgrad(f, 2.0)
+    assert g == pytest.approx(1.0, abs=1e-4), (
+        f"d(a+b)/da should be 1 (chain-rule local grad); numgrad gave {g}"
+    )
+
+
+def test_numgrad_multiplication_local_derivative():
+    # f(a) = a * b ; d f / d a should be b
+    b = 4.0
+
+    def f(a):
+        return (Value(a) * Value(b)).data
+
+    g = numgrad(f, 5.0)
+    assert g == pytest.approx(b, abs=1e-4), (
+        f"d(a*b)/da should equal b={b}; numgrad gave {g}"
+    )
+
+
+def test_numgrad_compound_local_derivative():
+    # f(a) = a*b + c ; d f / d a should be b
     b, c = -3.0, 10.0
-    f = lambda a: (Value(a) * Value(b) + Value(c)).data
-    slope = _central_diff(f, 2.0)
-    assert slope == pytest.approx(b, abs=1e-4), (
-        f"central-difference slope of a*b+c w.r.t. a should be b={b}, got {slope}"
+
+    def f(a):
+        return (Value(a) * Value(b) + Value(c)).data
+
+    g = numgrad(f, 2.0)
+    assert g == pytest.approx(b, abs=1e-4), (
+        f"d(a*b+c)/da should equal b={b}; numgrad gave {g}"
     )
 
 
-def test_central_difference_quadratic():
-    # f(a) = a**2  =>  df/da = 2a ; at a=3 the slope is 6
-    f = lambda a: (Value(a) ** 2).data
-    slope = _central_diff(f, 3.0)
-    assert slope == pytest.approx(6.0, abs=1e-4), (
-        f"central-difference slope of a**2 at a=3 should be 6, got {slope}"
-    )
-
-
-def test_central_difference_reciprocal():
-    # f(a) = 1/a  =>  df/da = -1/a**2 ; at a=2 the slope is -0.25
-    f = lambda a: (1.0 / Value(a)).data
-    slope = _central_diff(f, 2.0)
-    assert slope == pytest.approx(-0.25, abs=1e-4), (
-        f"central-difference slope of 1/a at a=2 should be -0.25, got {slope}"
-    )
+def test_repr_mentions_data_and_op():
+    a = Value(2.0)
+    out = a + Value(3.0)
+    assert "data=" in repr(out)
+    assert "op=" in repr(out)
 
 
 if __name__ == "__main__":

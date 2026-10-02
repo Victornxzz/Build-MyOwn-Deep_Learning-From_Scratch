@@ -10,8 +10,8 @@ class Value :
 
     def _make(self, data, _children, _op): return type(self)(data, _children, _op)
 
-    def __repr__ (self): 
-        return f"Value(data={self.data})"
+    def __repr__(self):
+        return f"Value(data={self.data}, op='{self._op}')"
 
     def __add__(self, other):
         other = other if isinstance(other, Value) else type(self)(other)
@@ -48,4 +48,20 @@ class Value :
         other = other if isinstance(other, Value) else type(self)(other)
         return other / self
 
-    
+def trace(root):
+
+    nodes = set()
+    edges = set()
+
+    def build(v):
+
+        if v not in nodes:
+
+            nodes.add(v)
+            for child in v._prev:
+                edges.add((child, v))
+                build(child)
+
+    build(root)
+
+    return nodes, edges
