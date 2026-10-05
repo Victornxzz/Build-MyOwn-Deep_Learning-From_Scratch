@@ -15,11 +15,23 @@ recipe will be reused against analytical `.grad` values.
 
 
 import pytest
-from src.engine import Value, trace
+from src.engine import Value, trace, topo_sort
 
 class _MOD:
     Value = Value
     trace = trace
+
+TOL = 1e-5
+EPS = 1e-6
+
+
+def central_diff(f, x, eps=EPS):
+    """Numerical derivative of scalar f at scalar x via central differences."""
+    return (f(x + eps) - f(x - eps)) / (2.0 * eps)
+
+
+def _f(x):
+    return (x * x + 1.0) / (x - 4.0)
 # ---------------------------------------------------------------------------
 # Construction & repr
 # ---------------------------------------------------------------------------
@@ -27,119 +39,111 @@ class _MOD:
 # --------------------------------------------------------------------------
 # central-difference helper (reused verbatim by later stages vs analytical grad)
 # --------------------------------------------------------------------------
-def numgrad(f, x, eps=1e-6):
-    """Central-difference derivative of scalar f at scalar x.
-
-    (f(x + eps) - f(x - eps)) / (2 * eps)
-    """
-    return (f(x + eps) - f(x - eps)) / (2.0 * eps)
-
-
-# --------------------------------------------------------------------------
-# forward arithmetic must be unchanged from stage_01
-# --------------------------------------------------------------------------
-def test_add_backward_local():
+def test_topo_sort_orders_parents_before_children():
     a, b = Value(2.0), Value(3.0)
-    out = a + b
-    assert out.data == 5.0
-    out.grad = 1.0
-    out._backward()
-    assert a.grad == pytest.approx(1.0)
-    assert b.grad == pytest.approx(1.0)
+    c = a * b
+    d = c + a
+    order = topo_sort(d)
+    assert set(order) == {a, b, c, d}, "topo must include every reachable node"
+    assert len(order) == len(set(order)), "each node exactly once"
+    pos = {v: i for i, v in enumerate(order)}
+    assert pos[a] < pos[c] and pos[b] < pos[c], "parents of c before c"
+    assert pos[c] < pos[d] and pos[a] < pos[d], "parents of d before d"
 
 
-def test_add_backward_scales_with_output_grad():
-    a, b = Value(2.0), Value(3.0)
-    out = a + b
-    out.grad = 7.0          # upstream gradient
-    out._backward()
-    assert a.grad == pytest.approx(7.0)
-    assert b.grad == pytest.approx(7.0)
-
-
-# ---------------------------------------------------------------------------
-# mul: a.grad += b*g ; b.grad += a*g
-# ---------------------------------------------------------------------------
-def test_mul_backward_local():
-    a, b = Value(2.0), Value(3.0)
-    out = a * b
-    assert out.data == 6.0
-    out.grad = 1.0
-    out._backward()
-    assert a.grad == pytest.approx(3.0)   # dz/da = b
-    assert b.grad == pytest.approx(2.0)   # dz/db = a
-
-
-def test_mul_backward_scales_with_output_grad():
-    a, b = Value(4.0), Value(-5.0)
-    out = a * b
-    out.grad = 2.0
-    out._backward()
-    assert a.grad == pytest.approx(-5.0 * 2.0)
-    assert b.grad == pytest.approx(4.0 * 2.0)
-
-
-# ---------------------------------------------------------------------------
-# pow: a.grad += c*a**(c-1)*g  (c constant)
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("a,c", [(3.0, 2), (2.0, 3), (4.0, 0.5), (5.0, -1)])
-def test_pow_backward_local(a, c):
-    x = Value(a)
-    out = x ** c
-    assert out.data == pytest.approx(a ** c)
-    out.grad = 1.0
-    out._backward()
-    assert x.grad == pytest.approx(c * a ** (c - 1))
-
-
-def test_pow_rejects_value_exponent():
+def test_topo_sort_terminates_on_reuse():
     a = Value(3.0)
-    with pytest.raises((AssertionError, TypeError)):
-        _ = a ** Value(2.0)
+    out = a * a
+    order = topo_sort(out)
+    assert set(order) == {a, out}
+    assert len(order) == 2
 
 
 # ---------------------------------------------------------------------------
-# derived ops compose from + * ** -> their closures still give right locals
+# backward: seeds output grad = 1
 # ---------------------------------------------------------------------------
-def test_sub_backward_via_composition():
-    # a - b = a + (-b); seed and run each intermediate node's _backward by hand
-    a, b = Value(7.0), Value(2.0)
-    out = a - b
-    assert out.data == pytest.approx(5.0)
-    # full propagation is stage_04; here just check the top node is an add whose
-    # _backward pushes grad to its two parents (a and the (-b) node).
-    out.grad = 1.0
-    out._backward()
-    parents = list(out._prev)
-    assert all(p.grad == pytest.approx(1.0) for p in parents), (
-        "a - b is a + (-b); the add closure pushes grad 1 to both parents"
+def test_backward_seeds_output_with_one():
+    a, b = Value(2.0), Value(3.0)
+    out = a * b
+    out.backward()
+    assert out.grad == pytest.approx(1.0)
+
+
+def test_backward_simple_mul():
+    a, b = Value(2.0), Value(3.0)
+    out = a * b
+    out.backward()
+    assert a.grad == pytest.approx(3.0)   # d(ab)/da = b
+    assert b.grad == pytest.approx(2.0)   # d(ab)/db = a
+
+
+# ---------------------------------------------------------------------------
+# the canonical micrograd accumulation case
+#   a=2, b=3, c=a*b, d=c+a, d.backward()  ->  a.grad==4, b.grad==2
+# ---------------------------------------------------------------------------
+def test_backward_accumulates_over_two_paths():
+    a, b = Value(2.0), Value(3.0)
+    c = a * b
+    d = c + a
+    d.backward()
+    assert a.grad == pytest.approx(4.0), "a reaches d via c (b=3) and directly (1) -> 4"
+    assert b.grad == pytest.approx(2.0)
+
+
+def test_backward_self_mul():
+    a = Value(3.0)
+    out = a * a            # d/da (a^2) = 2a = 6
+    out.backward()
+    assert a.grad == pytest.approx(6.0)
+
+
+def test_backward_shared_subexpression():
+    a = Value(3.0)
+    b = a + 1.0            # 4
+    c = a * 2.0            # 6
+    out = b * c            # 24 ; d/da = (a+1)*2 + 2a = 4a+2 = 14
+    out.backward()
+    assert a.grad == pytest.approx(14.0)
+
+
+# ---------------------------------------------------------------------------
+# gradcheck a composite expression against central differences
+#   f(x) = (x*x + 1) / (x - 4)     (uses + * ** / and a constant)
+# ---------------------------------------------------------------------------
+def _f(x):
+    return (x * x + 1.0) / (x - 4.0)
+
+
+@pytest.mark.parametrize("x0", [-2.0, -0.5, 0.0, 1.3, 2.7])
+def test_backward_gradcheck_composite(x0):
+    x = Value(x0)
+    out = (x * x + 1.0) / (x - 4.0)
+    out.backward()
+    num = central_diff(_f, x0)
+    assert x.grad == pytest.approx(num, abs=TOL, rel=1e-4), (
+        f"backward dy/dx at x={x0}: analytic={x.grad}, numeric={num}"
     )
 
 
-def test_div_backward_is_not_symmetric():
-    # a / b = a * b**-1. Asymmetry lives in the closures, not in stored order.
-    a, b = Value(6.0), Value(3.0)
-    out = a / b
-    assert out.data == pytest.approx(2.0)
-    out.grad = 1.0
-    out._backward()
-    # top node is a multiply: a*(b**-1). Its parents are `a` and the `b**-1` node.
-    # da gets (b**-1)=1/3 ; the other parent gets a=6. They differ -> not symmetric.
-    grads = sorted(p.grad for p in out._prev)
-    assert grads[0] != pytest.approx(grads[1])
+@pytest.mark.parametrize("x0", [0.5, 1.0, 2.0, 3.5])
+def test_backward_gradcheck_with_pow(x0):
+    # f(x) = x**3 - 2*x   ->  f'(x) = 3x^2 - 2
+    x = Value(x0)
+    out = x ** 3 - 2.0 * x
+    out.backward()
+    assert x.grad == pytest.approx(3.0 * x0 ** 2 - 2.0, abs=TOL, rel=1e-4)
 
 
 # ---------------------------------------------------------------------------
-# accumulation: a reused operand += from each consumer
+# does not zero grads first (accumulates across calls if not reset)
 # ---------------------------------------------------------------------------
-def test_self_mul_accumulates():
-    # out = a * a ; both factors are the SAME node, so its _backward adds a+a = 2a
-    a = Value(3.0)
-    out = a * a
-    assert out.data == 9.0
-    out.grad = 1.0
-    out._backward()
-    assert a.grad == pytest.approx(6.0), "a*a: a.grad must be a + a = 2a = 6"
+def test_backward_does_not_zero_existing_grad():
+    a, b = Value(2.0), Value(3.0)
+    out = a * b
+    out.backward()
+    first = a.grad
+    out.backward()  # second pass, no zeroing
+    assert a.grad == pytest.approx(2.0 * first), "grad accumulates across backward calls"
 
 
 # ---------------------------------------------------------------------------

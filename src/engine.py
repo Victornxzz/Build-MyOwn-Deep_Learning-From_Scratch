@@ -1,4 +1,4 @@
-from typing import Union, List
+from typing import Union, List, Set, Tuple
 
 Number = Union[int, float]
 
@@ -73,6 +73,13 @@ class Value :
         other = other if isinstance(other, Value) else type(self)(other)
         return other / self
 
+    def backward(self) -> None:
+        topo = topo_sort(self) 
+        self.grad = 1.0
+        for node in reversed(topo): 
+            node._backward()
+
+
 def trace(root):
 
     nodes: set[Value] = set()
@@ -90,3 +97,16 @@ def trace(root):
     build(root)
 
     return nodes, edges
+
+def topo_sort(root: Value) -> List[Value]:
+    topo: List[Value] = []
+    visited: Set[Value] = set()
+    
+    def build_topo(v: Value) -> None:
+        if v not in visited:
+            visited.add(v)
+            for child in v._prev:
+                build_topo(child)
+            topo.append(v)
+    build_topo(root)
+    return topo
