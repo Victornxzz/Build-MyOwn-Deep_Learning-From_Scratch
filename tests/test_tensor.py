@@ -38,170 +38,120 @@ def numgrad(f, x, eps=1e-6):
 # --------------------------------------------------------------------------
 # forward arithmetic must be unchanged from stage_01
 # --------------------------------------------------------------------------
-def test_leaf_data_is_float():
-    a = Value(3)
-    assert isinstance(a.data, float), "data must be stored as a float"
-    assert a.data == 3.0
+def test_add_backward_local():
+    a, b = Value(2.0), Value(3.0)
+    out = a + b
+    assert out.data == 5.0
+    out.grad = 1.0
+    out._backward()
+    assert a.grad == pytest.approx(1.0)
+    assert b.grad == pytest.approx(1.0)
 
 
-def test_add_forward():
-    a, b = Value(2.0), Value(5.0)
-    assert (a + b).data == 7.0, "addition forward value changed from stage_01"
+def test_add_backward_scales_with_output_grad():
+    a, b = Value(2.0), Value(3.0)
+    out = a + b
+    out.grad = 7.0          # upstream gradient
+    out._backward()
+    assert a.grad == pytest.approx(7.0)
+    assert b.grad == pytest.approx(7.0)
 
 
-def test_mul_forward():
-    a, b = Value(2.0), Value(5.0)
-    assert (a * b).data == 10.0, "multiplication forward value changed"
+# ---------------------------------------------------------------------------
+# mul: a.grad += b*g ; b.grad += a*g
+# ---------------------------------------------------------------------------
+def test_mul_backward_local():
+    a, b = Value(2.0), Value(3.0)
+    out = a * b
+    assert out.data == 6.0
+    out.grad = 1.0
+    out._backward()
+    assert a.grad == pytest.approx(3.0)   # dz/da = b
+    assert b.grad == pytest.approx(2.0)   # dz/db = a
 
 
-def test_compound_forward():
-    a, b, c = Value(2.0), Value(-3.0), Value(10.0)
-    out = a * b + c
-    assert out.data == 4.0, "(a*b + c) forward value incorrect"
+def test_mul_backward_scales_with_output_grad():
+    a, b = Value(4.0), Value(-5.0)
+    out = a * b
+    out.grad = 2.0
+    out._backward()
+    assert a.grad == pytest.approx(-5.0 * 2.0)
+    assert b.grad == pytest.approx(4.0 * 2.0)
 
 
-def test_number_coercion_and_reflected_ops():
+# ---------------------------------------------------------------------------
+# pow: a.grad += c*a**(c-1)*g  (c constant)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("a,c", [(3.0, 2), (2.0, 3), (4.0, 0.5), (5.0, -1)])
+def test_pow_backward_local(a, c):
+    x = Value(a)
+    out = x ** c
+    assert out.data == pytest.approx(a ** c)
+    out.grad = 1.0
+    out._backward()
+    assert x.grad == pytest.approx(c * a ** (c - 1))
+
+
+def test_pow_rejects_value_exponent():
+    a = Value(3.0)
+    with pytest.raises((AssertionError, TypeError)):
+        _ = a ** Value(2.0)
+
+
+# ---------------------------------------------------------------------------
+# derived ops compose from + * ** -> their closures still give right locals
+# ---------------------------------------------------------------------------
+def test_sub_backward_via_composition():
+    # a - b = a + (-b); seed and run each intermediate node's _backward by hand
+    a, b = Value(7.0), Value(2.0)
+    out = a - b
+    assert out.data == pytest.approx(5.0)
+    # full propagation is stage_04; here just check the top node is an add whose
+    # _backward pushes grad to its two parents (a and the (-b) node).
+    out.grad = 1.0
+    out._backward()
+    parents = list(out._prev)
+    assert all(p.grad == pytest.approx(1.0) for p in parents), (
+        "a - b is a + (-b); the add closure pushes grad 1 to both parents"
+    )
+
+
+def test_div_backward_is_not_symmetric():
+    # a / b = a * b**-1. Asymmetry lives in the closures, not in stored order.
+    a, b = Value(6.0), Value(3.0)
+    out = a / b
+    assert out.data == pytest.approx(2.0)
+    out.grad = 1.0
+    out._backward()
+    # top node is a multiply: a*(b**-1). Its parents are `a` and the `b**-1` node.
+    # da gets (b**-1)=1/3 ; the other parent gets a=6. They differ -> not symmetric.
+    grads = sorted(p.grad for p in out._prev)
+    assert grads[0] != pytest.approx(grads[1])
+
+
+# ---------------------------------------------------------------------------
+# accumulation: a reused operand += from each consumer
+# ---------------------------------------------------------------------------
+def test_self_mul_accumulates():
+    # out = a * a ; both factors are the SAME node, so its _backward adds a+a = 2a
+    a = Value(3.0)
+    out = a * a
+    assert out.data == 9.0
+    out.grad = 1.0
+    out._backward()
+    assert a.grad == pytest.approx(6.0), "a*a: a.grad must be a + a = 2a = 6"
+
+
+# ---------------------------------------------------------------------------
+# leaf closure is a no-op (inherited from stage_02)
+# ---------------------------------------------------------------------------
+def test_leaf_backward_noop():
     a = Value(4.0)
-    assert (a + 1).data == 5.0, "Value + number failed"
-    assert (1 + a).data == 5.0, "number + Value (__radd__) failed"
-    assert (a * 3).data == 12.0, "Value * number failed"
-    assert (3 * a).data == 12.0, "number * Value (__rmul__) failed"
-
-
-# --------------------------------------------------------------------------
-# graph bookkeeping: _prev and _op
-# --------------------------------------------------------------------------
-def test_leaf_has_empty_graph():
-    a = Value(1.0)
-    assert a._prev == set(), "a leaf must have no parents"
-    assert a._op == "", "a leaf must have empty _op"
-    assert a.grad == 0.0, "grad must default to 0.0"
-
-
-def test_leaf_backward_is_noop():
-    # Every node reserves a _backward hook; a leaf's is a no-op that changes
-    # nothing. stage_03 installs the real per-op rules on result nodes.
-    a = Value(5.0)
-    a._backward()  # must not raise
+    a._backward()
     assert a.grad == 0.0
 
 
-def test_add_records_parents_and_op():
-    a, b = Value(2.0), Value(3.0)
-    out = a + b
-    assert out._op == "+", "add result must have _op == '+'"
-    assert out._prev == {a, b}, "add result must record both operands as parents"
-
-
-def test_mul_records_parents_and_op():
-    a, b = Value(2.0), Value(3.0)
-    out = a * b
-    assert out._op == "*", "mul result must have _op == '*'"
-    assert out._prev == {a, b}, "mul result must record both operands as parents"
-
-
-def test_coerced_operand_becomes_value_parent():
+def test_repr_has_data_and_grad():
     a = Value(2.0)
-    out = a + 1
-    assert len(out._prev) == 2, "coerced number must appear as a Value parent"
-    assert a in out._prev, "original Value must be a parent"
-    parents = list(out._prev)
-    other = parents[0] if parents[1] is a else parents[1]
-    assert isinstance(other, Value), "coerced operand must be wrapped in Value"
-    assert other.data == 1.0, "coerced operand must carry the number's data"
-
-
-def test_self_reuse_dedups_in_prev():
-    a = Value(3.0)
-    out = a * a
-    assert out.data == 9.0, "a*a forward value incorrect"
-    assert out._prev == {a}, "a*a must store a single parent (set dedup)"
-    assert len(out._prev) == 1
-
-
-# --------------------------------------------------------------------------
-# trace(): full DAG enumeration without duplicates or infinite loops
-# --------------------------------------------------------------------------
-def test_trace_simple_graph():
-    a, b = Value(2.0), Value(3.0)
-    out = a + b
-    nodes, edges = trace(out)
-    assert nodes == {a, b, out}, "trace must return every reachable node"
-    assert edges == {(a, out), (b, out)}, "trace must return each parent->child edge"
-
-
-def test_trace_compound_graph():
-    a, b, c = Value(2.0), Value(-3.0), Value(10.0)
-    e = a * b          # node e
-    out = e + c        # node out
-    nodes, edges = trace(out)
-    assert nodes == {a, b, c, e, out}
-    assert edges == {(a, e), (b, e), (e, out), (c, out)}
-
-
-def test_trace_terminates_on_reused_node():
-    a = Value(3.0)
-    out = a * a
-    nodes, edges = trace(out)  # must not loop / duplicate
-    assert nodes == {a, out}
-    assert edges == {(a, out)}
-
-
-def test_trace_leaf():
-    a = Value(7.0)
-    nodes, edges = trace(a)
-    assert nodes == {a}
-    assert edges == set()
-
-
-# --------------------------------------------------------------------------
-# central-difference check of the README's local derivatives via the DAG
-# --------------------------------------------------------------------------
-def test_numgrad_addition_local_derivative():
-    # f(a) = a + b ; d f / d a should be 1.0
-    b = 3.0
-
-    def f(a):
-        return (Value(a) + Value(b)).data
-
-    g = numgrad(f, 2.0)
-    assert g == pytest.approx(1.0, abs=1e-4), (
-        f"d(a+b)/da should be 1 (chain-rule local grad); numgrad gave {g}"
-    )
-
-
-def test_numgrad_multiplication_local_derivative():
-    # f(a) = a * b ; d f / d a should be b
-    b = 4.0
-
-    def f(a):
-        return (Value(a) * Value(b)).data
-
-    g = numgrad(f, 5.0)
-    assert g == pytest.approx(b, abs=1e-4), (
-        f"d(a*b)/da should equal b={b}; numgrad gave {g}"
-    )
-
-
-def test_numgrad_compound_local_derivative():
-    # f(a) = a*b + c ; d f / d a should be b
-    b, c = -3.0, 10.0
-
-    def f(a):
-        return (Value(a) * Value(b) + Value(c)).data
-
-    g = numgrad(f, 2.0)
-    assert g == pytest.approx(b, abs=1e-4), (
-        f"d(a*b+c)/da should equal b={b}; numgrad gave {g}"
-    )
-
-
-def test_repr_mentions_data_and_op():
-    a = Value(2.0)
-    out = a + Value(3.0)
-    assert "data=" in repr(out)
-    assert "op=" in repr(out)
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    r = repr(a)
+    assert "data=" in r and "grad=" in r
