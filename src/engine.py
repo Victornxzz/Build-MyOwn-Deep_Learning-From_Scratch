@@ -1,4 +1,5 @@
 from typing import Union, List, Set, Tuple
+import math
 
 Number = Union[int, float]
 
@@ -72,6 +73,36 @@ class Value :
     def __rtruediv__(self, other) -> "Value":
         other = other if isinstance(other, Value) else type(self)(other)
         return other / self
+
+    def tanh(self) -> "Value":
+        x = self.data
+        t = math.tanh(x)
+        out = self._make(t, (self,), "tanh")
+
+        def _backward():
+            self.grad += (1.0 - t ** 2) * out.grad
+
+        out._backward = _backward
+        return out
+
+    def exp(self) -> "Value":
+        x = self.data
+        out = self._make(math.exp(x), (self,), "exp")
+
+        def _backward():
+            self.grad += out.data * out.grad
+
+        out._backward = _backward
+        return out
+
+    def relu(self) -> "Value":
+        out = self._make(self.data if self.data > 0 else 0.0, (self,), "ReLU")
+
+        def _backward():
+            self.grad += (1.0 if out.data > 0 else 0.0) * out.grad
+
+        out._backward = _backward
+        return out
 
     def backward(self) -> None:
         topo = topo_sort(self) 
