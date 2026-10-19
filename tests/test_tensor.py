@@ -1,426 +1,498 @@
-"""Tests for Stage 34: Capstone -- CIFAR-10.
-
-Verifies the CIFAR-10 capstone built on top of the custom autograd and neural net engine.
-"""
-
-from __future__ import annotations
-
-import os
-import sys
-import numpy as np
+import random
 import pytest
+import numpy as np
+import math
+from src.engine import Value
+from src.vec import Vec, Mat
+from src.tensor import Tensor
 
-# Adiciona a raiz do projeto ao sys.path para garantir importações limpas de `src`
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-
-# Importações diretas dos módulos do projeto
-try:
-    from src.engine import Value
-    from src.tensor import Tensor, Vec
-    from src.nn import (
-        Adam,
-        Augment,
-        BatchNorm2d,
-        ConvNet,
-        Conv2D,
-        accuracy,
-        cosine_lr,
-        cross_entropy_loss,
-        make_cifar_like,
-        normalize,
-        random_crop,
-        random_horizontal_flip,
-        step_lr,
-        train_cifar,
-        DataLoader,
-        Dataset,
-    )
-except (ImportError, ModuleNotFoundError) as exc:
-    # Se os módulos ainda estiverem em desenvolvimento, faz skip limpo
-    pytest.skip(
-        f"Módulos do estágio 34 ou dependências prévias ainda não implementados: {exc}",
-        allow_module_level=True,
-    )
-
-RNG = np.random.default_rng(34)
-EPS = 1e-5
-ATOL_BN = 1e-5
-ATOL_E2E = 1e-4
-RTOL = 1e-3
+EPS = 1e-6
+TOL = 1e-6
 
 
-# --- Helpers de compatibilidade ---------------------------------------------
-def as_array(t):
-    """Retorna o ndarray subjacente de um Tensor ou repassa o próprio array."""
-    return np.asarray(t.data if hasattr(t, "data") else t, dtype=float)
+# --------------------------------------------------------------------------- #
+# central-difference gradcheck on a scalar-valued function of one scalar input
+# --------------------------------------------------------------------------- #
+def numeric_grad_scalar(f, x, eps=EPS):
+    """Central-difference d f / d x for scalar float x and scalar output f."""
+    return (f(x + eps) - f(x - eps)) / (2 * eps)
 
 
-def make_tensor(arr):
-    """Instancia um Tensor a partir de um array NumPy."""
-    arr = np.asarray(arr, dtype=float)
-    try:
-        return Tensor(arr, requires_grad=True)
-    except TypeError:
-        return Tensor(arr)
+def analytic_grad_scalar(build, x):
+    """leaf = Tensor(x); out = build(leaf) (0-d); backward; return leaf.grad."""
+    leaf = Tensor(float(x))
+    out = build(leaf)
+    out.backward()
+    return float(leaf.grad)
 
 
-def scalar(t):
-    """Extrai um float escalar de um Tensor de tamanho 1 ou retorna a soma."""
-    a = as_array(t)
-    return float(a.reshape(-1)[0]) if a.size == 1 else float(a.sum())
+# A library of scalar functions: (engine build via Tensor, plain-float ref).
+SCALAR_FUNCS = {
+    "add_const":   (lambda t: t + 3.0,            lambda x: x + 3.0),
+    "radd_const":  (lambda t: 3.0 + t,            lambda x: 3.0 + x),
+    "mul_const":   (lambda t: t * 2.5,            lambda x: x * 2.5),
+    "rmul_const":  (lambda t: 2.5 * t,            lambda x: 2.5 * x),
+    "neg":         (lambda t: -t,                 lambda x: -x),
+    "sub_const":   (lambda t: t - 1.5,            lambda x: x - 1.5),
+    "rsub_const":  (lambda t: 5.0 - t,            lambda x: 5.0 - x),
+    "pow2":        (lambda t: t ** 2,             lambda x: x ** 2),
+    "pow3":        (lambda t: t ** 3,             lambda x: x ** 3),
+    "powhalf":     (lambda t: t ** 0.5,           lambda x: x ** 0.5),
+    "div_const":   (lambda t: t / 4.0,            lambda x: x / 4.0),
+    "rdiv_const":  (lambda t: 6.0 / t,            lambda x: 6.0 / x),
+    "relu":        (lambda t: t.relu(),           lambda x: max(0.0, x)),
+    "tanh":        (lambda t: t.tanh(),           lambda x: math.tanh(x)),
+    "exp":         (lambda t: t.exp(),            lambda x: math.exp(x)),
+    "log":         (lambda t: t.log(),            lambda x: math.log(x)),
+    "self_mul":    (lambda t: t * t,              lambda x: x * x),
+    "self_add":    (lambda t: t + t,              lambda x: x + x),
+    "reuse":       (lambda t: t * t + t,          lambda x: x * x + x),
+    "composite":   (lambda t: (t * 2.0 + 1.0).relu() ** 2,
+                    lambda x: max(0.0, x * 2.0 + 1.0) ** 2),
+    "ratio":       (lambda t: (t + 1.0) / (t * t + 2.0),
+                    lambda x: (x + 1.0) / (x * x + 2.0)),
+}
+
+# Inputs chosen positive for pow with fractional exponent / division stability,
+# and away from the ReLU kink at 0.
+SCALAR_INPUTS = [0.7, 1.3, 2.0, 3.5, -0.4]
 
 
-def skip_if_unbuilt(fn, *args, **kwargs):
-    """Executa a função e dá skip caso encontre um NotImplementedError de esqueleto."""
-    try:
-        return fn(*args, **kwargs)
-    except NotImplementedError as exc:
-        pytest.skip(f"Esqueleto ainda não implementado: {exc}")
+@pytest.mark.parametrize("name", list(SCALAR_FUNCS))
+@pytest.mark.parametrize("x", SCALAR_INPUTS)
+def test_scalar_gradcheck(name, x):
+    build, ref = SCALAR_FUNCS[name]
+    # skip points where the reference is undefined (fractional pow / div of neg)
+    if name in ("powhalf", "rdiv_const", "div_const") and x <= 0:
+        pytest.skip("function undefined / unstable for non-positive input")
+    if name == "relu" and abs(x) < 1e-3:
+        pytest.skip("ReLU kink")
 
+    if name == "log" and x <= 0:
+        pytest.skip("log undefined for non-positive input")
 
-# ---------------------------------------------------------------------------
-# BatchNorm2d forward: train vs eval
-# ---------------------------------------------------------------------------
-def test_batchnorm2d_train_standardizes_per_channel():
-    """No modo de treino, cada canal de saída deve ter média ~0 e variância ~1."""
-    x = RNG.standard_normal((8, 3, 5, 5)) * 2.0 + 1.0
-    bn = skip_if_unbuilt(BatchNorm2d, 3)
-    out = skip_if_unbuilt(bn, make_tensor(x))
-    assert out.shape == (8, 3, 5, 5), f"Shape alterado: {out.shape}"
-    o = as_array(out)
-    
-    mean_c = o.mean(axis=(0, 2, 3))
-    var_c = o.var(axis=(0, 2, 3))
-    np.testing.assert_allclose(
-        mean_c, np.zeros(3), atol=1e-6,
-        err_msg="BatchNorm2d train output deve ter média zero por canal.",
-    )
-    np.testing.assert_allclose(
-        var_c, np.ones(3), atol=1e-3,
-        err_msg="BatchNorm2d train output deve ter variância unitária por canal.",
+    ana = analytic_grad_scalar(build, x)
+    num = numeric_grad_scalar(ref, x)
+    assert np.isclose(ana, num, rtol=1e-4, atol=TOL), (
+        f"{name} at x={x}: analytic grad {ana} != numeric {num}"
     )
 
 
-def test_batchnorm2d_train_updates_running_buffers():
-    """O forward em modo train deve atualizar running_mean e running_var."""
-    bn = skip_if_unbuilt(BatchNorm2d, 3, momentum=0.5)
-    rm0 = np.array(bn.running_mean, dtype=float)
-    rv0 = np.array(bn.running_var, dtype=float)
-    x = RNG.standard_normal((6, 3, 4, 4)) + 3.0
-    skip_if_unbuilt(bn, make_tensor(x))
-    assert not np.allclose(bn.running_mean, rm0), "running_mean deve ser atualizado no modo train."
-    assert not np.allclose(bn.running_var, rv0), "running_var deve ser atualizado no modo train."
-
-
-def test_batchnorm2d_eval_uses_buffers_no_update():
-    """O forward em modo eval deve usar os buffers fixos e não alterá-los."""
-    bn = skip_if_unbuilt(BatchNorm2d, 2)
-    skip_if_unbuilt(bn.eval)
-    rm0 = np.array(bn.running_mean, dtype=float)
-    rv0 = np.array(bn.running_var, dtype=float)
-    x = RNG.standard_normal((5, 2, 3, 3))
-    out = skip_if_unbuilt(bn, make_tensor(x))
-    assert out.shape == (5, 2, 3, 3)
-    np.testing.assert_allclose(
-        bn.running_mean, rm0, atol=1e-12,
-        err_msg="eval forward NÃO deve alterar running_mean.",
-    )
-    np.testing.assert_allclose(
-        bn.running_var, rv0, atol=1e-12,
-        err_msg="eval forward NÃO deve alterar running_var.",
+@pytest.mark.parametrize("name", list(SCALAR_FUNCS))
+@pytest.mark.parametrize("x", SCALAR_INPUTS)
+def test_scalar_forward(name, x):
+    build, ref = SCALAR_FUNCS[name]
+    if name in ("powhalf", "rdiv_const", "div_const", "log") and x <= 0:
+        pytest.skip("function undefined for non-positive input")
+    out = build(Tensor(float(x)))
+    assert np.isclose(float(out.data), ref(x), rtol=1e-6, atol=1e-9), (
+        f"{name} at x={x}: forward {float(out.data)} != reference {ref(x)}"
     )
 
 
-def test_batchnorm2d_parameters_excludes_buffers():
-    """parameters() deve conter apenas [gamma, beta], excluindo buffers."""
-    bn = skip_if_unbuilt(BatchNorm2d, 4)
-    params = skip_if_unbuilt(bn.parameters)
-    assert len(params) == 2, "BatchNorm2d.parameters() deve retornar [gamma, beta]."
-    for p in params:
-        assert as_array(p).shape == (4,), "gamma e beta devem ter shape (C,)."
+# --------------------------------------------------------------------------- #
+# construction / basic invariants
+# --------------------------------------------------------------------------- #
+def test_construct_from_scalar_list_array():
+    a = Tensor(3.0)
+    b = Tensor([1.0, 2.0, 3.0])
+    c = Tensor(np.array([[1.0, 2.0], [3.0, 4.0]]))
+    for t in (a, b, c):
+        assert isinstance(t.data, np.ndarray)
+        assert t.data.dtype == np.float64
+        assert t.grad.shape == t.data.shape
+        assert np.all(t.grad == 0.0)
+        assert t._prev == ()
+        assert t._op == ""
 
 
-# ---------------------------------------------------------------------------
-# BatchNorm2d backward: gradcheck analítico vs numérico
-# ---------------------------------------------------------------------------
-def _bn_loss(bn, xarr, w):
-    out = bn(make_tensor(xarr))
-    return (out * make_tensor(w)).sum()
+def test_shape_property():
+    t = Tensor(np.zeros((2, 3, 4)))
+    assert t.shape == (2, 3, 4)
 
 
-def test_batchnorm2d_gradcheck_input():
-    shape = (4, 2, 3, 3)
-    x0 = RNG.standard_normal(shape)
-    w = RNG.standard_normal(shape)
-
-    bn = skip_if_unbuilt(BatchNorm2d, 2)
-    xt = make_tensor(x0)
-    out = skip_if_unbuilt(bn, xt)
-    loss = skip_if_unbuilt(lambda: (out * make_tensor(w)).sum())
-    skip_if_unbuilt(loss.backward)
-    g_analytic = np.array(xt.grad, dtype=float)
-
-    g_num = np.zeros_like(x0)
-    it = np.nditer(x0, flags=["multi_index"])
-    while not it.finished:
-        idx = it.multi_index
-        xp = x0.copy(); xp[idx] += EPS
-        xm = x0.copy(); xm[idx] -= EPS
-        fp = scalar(_bn_loss(BatchNorm2d(2), xp, w))
-        fm = scalar(_bn_loss(BatchNorm2d(2), xm, w))
-        g_num[idx] = (fp - fm) / (2 * EPS)
-        it.iternext()
-
-    np.testing.assert_allclose(
-        g_analytic, g_num, atol=ATOL_BN, rtol=RTOL,
-        err_msg="Gradiente de entrada do BatchNorm2d não bate com as diferenças centrais.",
-    )
+def test_data_is_assignable():
+    # Downstream code (e.g. Neuron training / gradcheck) overwrites params in
+    # place via `t.data = new_array`. The `data` property must expose a setter;
+    # a read-only property raises "property 'data' has no setter".
+    t = Tensor([1.0, 2.0])
+    t.data = np.array([3.0, 4.0])
+    assert np.allclose(t.data, [3.0, 4.0])
+    assert isinstance(t.data, np.ndarray) and t.data.dtype == np.float64
 
 
-def test_batchnorm2d_gradcheck_gamma_beta():
-    shape = (5, 3, 2, 2)
-    x0 = RNG.standard_normal(shape)
-    w = RNG.standard_normal(shape)
-
-    bn = skip_if_unbuilt(BatchNorm2d, 3)
-    bn.gamma.data[:] = RNG.standard_normal(3) * 0.5 + 1.0
-    bn.beta.data[:] = RNG.standard_normal(3) * 0.5
-    gamma0 = np.array(bn.gamma.data, dtype=float)
-    beta0 = np.array(bn.beta.data, dtype=float)
-
-    out = skip_if_unbuilt(bn, make_tensor(x0))
-    loss = skip_if_unbuilt(lambda: (out * make_tensor(w)).sum())
-    skip_if_unbuilt(loss.backward)
-    g_gamma = np.array(bn.gamma.grad, dtype=float)
-    g_beta = np.array(bn.beta.grad, dtype=float)
-
-    def loss_with_params(gamma_arr, beta_arr):
-        b = BatchNorm2d(3)
-        b.gamma.data[:] = gamma_arr
-        b.beta.data[:] = beta_arr
-        return scalar(_bn_loss_param(b, x0, w))
-
-    num_gamma = np.zeros(3)
-    num_beta = np.zeros(3)
-    for c in range(3):
-        gp = gamma0.copy(); gp[c] += EPS
-        gm = gamma0.copy(); gm[c] -= EPS
-        num_gamma[c] = (loss_with_params(gp, beta0) - loss_with_params(gm, beta0)) / (2 * EPS)
-        bp = beta0.copy(); bp[c] += EPS
-        bm = beta0.copy(); bm[c] -= EPS
-        num_beta[c] = (loss_with_params(gamma0, bp) - loss_with_params(gamma0, bm)) / (2 * EPS)
-
-    np.testing.assert_allclose(
-        g_gamma, num_gamma, atol=ATOL_BN, rtol=RTOL,
-        err_msg="Gradiente de gamma do BatchNorm2d não bate com as diferenças centrais.",
-    )
-    np.testing.assert_allclose(
-        g_beta, num_beta, atol=ATOL_BN, rtol=RTOL,
-        err_msg="Gradiente de beta do BatchNorm2d não bate com as diferenças centrais.",
-    )
+def test_repr_mentions_data_and_grad():
+    r = repr(Tensor([1.0, 2.0]))
+    assert "data" in r and "grad" in r
 
 
-def _bn_loss_param(bn, xarr, w):
-    out = bn(make_tensor(xarr))
-    return (out * make_tensor(w)).sum()
+# --------------------------------------------------------------------------- #
+# elementwise array forward + backward
+# --------------------------------------------------------------------------- #
+def test_array_add_forward_backward():
+    x = Tensor([1.0, 2.0, 3.0])
+    y = Tensor([4.0, 5.0, 6.0])
+    z = x + y
+    assert np.allclose(z.data, [5.0, 7.0, 9.0])
+    z.backward()
+    # d(sum-seeded ones)/dx = ones, same for y
+    assert np.allclose(x.grad, np.ones(3))
+    assert np.allclose(y.grad, np.ones(3))
 
 
-# ---------------------------------------------------------------------------
-# Augmentation
-# ---------------------------------------------------------------------------
-def test_random_crop_preserves_shape():
-    x = RNG.standard_normal((4, 3, 8, 8))
-    out = skip_if_unbuilt(random_crop, x, pad=2, rng=np.random.default_rng(0))
-    assert out.shape == x.shape, f"random_crop alterou a dimensão: {out.shape}"
+def test_array_mul_forward_backward():
+    x = Tensor([1.0, 2.0, 3.0])
+    y = Tensor([4.0, 5.0, 6.0])
+    z = x * y
+    assert np.allclose(z.data, [4.0, 10.0, 18.0])
+    z.backward()
+    # seed ones: dz/dx = y, dz/dy = x
+    assert np.allclose(x.grad, [4.0, 5.0, 6.0])
+    assert np.allclose(y.grad, [1.0, 2.0, 3.0])
 
 
-def test_random_horizontal_flip_shape_and_flips_some():
-    x = RNG.standard_normal((64, 3, 6, 6))
-    out = skip_if_unbuilt(random_horizontal_flip, x, p=1.0, rng=np.random.default_rng(0))
-    assert out.shape == x.shape
-    np.testing.assert_allclose(
-        out, x[:, :, :, ::-1], atol=1e-12,
-        err_msg="p=1.0 deve inverter horizontalmente todas as imagens no eixo de largura.",
-    )
+def test_array_pow_backward():
+    x = Tensor([1.0, 2.0, 3.0])
+    z = x ** 3
+    assert np.allclose(z.data, [1.0, 8.0, 27.0])
+    z.backward()
+    assert np.allclose(x.grad, 3.0 * np.array([1.0, 2.0, 3.0]) ** 2)
 
 
-def test_normalize_per_channel():
-    x = RNG.standard_normal((10, 3, 5, 5))
-    mean = [0.1, 0.2, 0.3]
-    std = [2.0, 0.5, 1.5]
-    out = skip_if_unbuilt(normalize, x, mean, std)
-    ref = (x - np.array(mean).reshape(1, 3, 1, 1)) / np.array(std).reshape(1, 3, 1, 1)
-    np.testing.assert_allclose(out, ref, atol=1e-12, err_msg="Incompatibilidade no normalize.")
+def test_array_relu_backward():
+    x = Tensor([-2.0, -0.5, 0.5, 3.0])
+    z = x.relu()
+    assert np.allclose(z.data, [0.0, 0.0, 0.5, 3.0])
+    z.backward()
+    assert np.allclose(x.grad, [0.0, 0.0, 1.0, 1.0])
 
 
-def test_augment_eval_is_normalize_only_and_returns_array():
-    x = RNG.standard_normal((6, 3, 8, 8))
-    mean = [0.0, 0.0, 0.0]
-    std = [1.0, 1.0, 1.0]
-    aug = skip_if_unbuilt(Augment, pad=4, flip_p=0.5, mean=mean, std=std, seed=0)
-    skip_if_unbuilt(aug.eval)
-    out = skip_if_unbuilt(aug, x)
-    assert isinstance(out, np.ndarray), "Augment deve retornar um ndarray do NumPy."
-    np.testing.assert_allclose(
-        out, x, atol=1e-12,
-        err_msg="Augment em eval com média 0 e desvio 1 deve se comportar como a identidade.",
-    )
+# --------------------------------------------------------------------------- #
+# elementwise transcendentals on NON-scalar arrays
+# --------------------------------------------------------------------------- #
+# These must work elementwise at full shape, not just on 0-d tensors. A
+# `math.tanh`/`math.exp`/`math.log` implementation passes the scalar gradchecks
+# above but raises "only 0-dimensional arrays can be converted to Python
+# scalars" the moment a real (n,) input arrives (e.g. a Neuron's tanh over a
+# batch). Use np.tanh / np.exp / np.log so the forward + local grad broadcast.
+def test_array_tanh_forward_backward():
+    x = Tensor([-1.0, 0.0, 2.0])
+    z = x.tanh()
+    assert np.allclose(z.data, np.tanh(x.data))
+    z.backward()
+    assert np.allclose(x.grad, 1.0 - np.tanh(x.data) ** 2)
+    assert x.grad.shape == x.data.shape
 
 
-# ---------------------------------------------------------------------------
-# Learning Rate Schedules
-# ---------------------------------------------------------------------------
-def test_cosine_lr_endpoints_and_midpoint():
-    base, mn, T = 0.1, 0.0, 100
-    assert abs(skip_if_unbuilt(cosine_lr, 0, T, base_lr=base, min_lr=mn) - base) < 1e-12
-    assert abs(skip_if_unbuilt(cosine_lr, T, T, base_lr=base, min_lr=mn) - mn) < 1e-9
-    mid = skip_if_unbuilt(cosine_lr, T // 2, T, base_lr=base, min_lr=mn)
-    assert abs(mid - 0.5 * base) < 1e-9, f"Ponto médio do cosine_lr deveria ser {0.5 * base}, obteve {mid}"
+def test_array_exp_forward_backward():
+    x = Tensor([-1.0, 0.5, 1.5])
+    z = x.exp()
+    assert np.allclose(z.data, np.exp(x.data))
+    z.backward()
+    # d/dx exp(x) = exp(x)
+    assert np.allclose(x.grad, np.exp(x.data))
+    assert x.grad.shape == x.data.shape
 
 
-def test_cosine_lr_monotone_decreasing():
-    T = 50
-    vals = [skip_if_unbuilt(cosine_lr, t, T, base_lr=1.0) for t in range(T + 1)]
-    assert all(vals[i] >= vals[i + 1] - 1e-12 for i in range(T)), "cosine_lr deve ser monotonamente decrescente."
+def test_array_log_forward_backward():
+    x = Tensor([0.5, 1.0, 3.0])
+    z = x.log()
+    assert np.allclose(z.data, np.log(x.data))
+    z.backward()
+    # d/dx log(x) = 1/x
+    assert np.allclose(x.grad, 1.0 / x.data)
+    assert x.grad.shape == x.data.shape
 
 
-def test_step_lr_drops():
-    base, de, g = 1.0, 10, 0.1
-    assert abs(skip_if_unbuilt(step_lr, 0, base_lr=base, drop_every=de, gamma=g) - 1.0) < 1e-12
-    assert abs(skip_if_unbuilt(step_lr, 9, base_lr=base, drop_every=de, gamma=g) - 1.0) < 1e-12
-    assert abs(skip_if_unbuilt(step_lr, 10, base_lr=base, drop_every=de, gamma=g) - 0.1) < 1e-12
-    assert abs(skip_if_unbuilt(step_lr, 20, base_lr=base, drop_every=de, gamma=g) - 0.01) < 1e-12
+def test_2d_tanh_forward_backward():
+    x = Tensor([[-1.0, 0.0], [0.5, 2.0]])
+    z = x.tanh()
+    assert np.allclose(z.data, np.tanh(x.data))
+    z.backward()
+    assert np.allclose(x.grad, 1.0 - np.tanh(x.data) ** 2)
+    assert x.grad.shape == x.data.shape
 
 
-# ---------------------------------------------------------------------------
-# ConvNet forward
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("in_shape,n_classes,channels", [
-    ((3, 32, 32), 10, (4, 8)),
-    ((3, 16, 16), 5, (4, 8)),
-    ((1, 8, 8), 3, (2, 4)),
-])
-def test_convnet_forward_shape(in_shape, n_classes, channels):
-    B = 3
-    model = skip_if_unbuilt(
-        ConvNet, in_shape, n_classes, channels=channels, hidden=8, seed=0
-    )
-    x = RNG.standard_normal((B, *in_shape))
-    logits = skip_if_unbuilt(model, x)
-    assert logits.shape == (B, n_classes), f"Esperava {(B, n_classes)}, obteve {logits.shape}"
-    C, H, W = in_shape
-    S = len(channels)
-    expected_flat = channels[-1] * (H // (2 ** S)) * (W // (2 ** S))
-    assert model.flat_dim == expected_flat, f"flat_dim deve ser deduzido ({expected_flat}); obteve {model.flat_dim}."
+# --------------------------------------------------------------------------- #
+# 0-d scalar operand broadcasts into an (n,)/(2-d) tensor
+# --------------------------------------------------------------------------- #
+# A Neuron stores its bias as a 0-d Tensor and computes `z = x @ w + b`. For a
+# batched input `x @ w` is (batch,), so `(batch,) + 0-d` must broadcast and the
+# bias must collect the summed upstream grad. A strict equal-shape `_at_shape`
+# assert rejects this even though the single-example `() + 0-d` case slips
+# through, so only a batched/array test catches the gap.
+def test_scalar_tensor_broadcasts_into_vector_add():
+    v = Tensor([1.0, 2.0, 3.0])
+    b = Tensor(0.5)  # 0-d
+    z = v + b
+    assert np.allclose(z.data, [1.5, 2.5, 3.5])
+    z.backward()
+    assert np.allclose(v.grad, np.ones(3))
+    # 0-d bias receives the sum of the upstream ones across the broadcast axis.
+    assert np.isclose(float(b.grad), 3.0)
+    assert b.grad.shape == b.data.shape
 
 
-def test_convnet_parameters_nonempty_and_unique():
-    model = skip_if_unbuilt(ConvNet, (3, 16, 16), 5, channels=(4, 8), seed=1)
-    params = skip_if_unbuilt(model.parameters)
-    assert len(params) >= 12, f"Esperava muitos parâmetros, obteve {len(params)}"
-    ids = [id(p) for p in params]
-    assert len(ids) == len(set(ids)), "parameters() não deve repetir tensores."
+def test_scalar_tensor_broadcasts_into_vector_mul():
+    v = Tensor([1.0, 2.0, 3.0])
+    s = Tensor(2.0)  # 0-d
+    z = v * s
+    assert np.allclose(z.data, [2.0, 4.0, 6.0])
+    z.backward()
+    # dz/dv = s (broadcast), dz/ds = sum(v) over the broadcast axis
+    assert np.allclose(v.grad, [2.0, 2.0, 2.0])
+    assert np.isclose(float(s.grad), 6.0)
+    assert s.grad.shape == s.data.shape
 
 
-def test_convnet_train_eval_propagates_to_batchnorm():
-    model = skip_if_unbuilt(ConvNet, (3, 16, 16), 5, channels=(4, 8), seed=2)
-    assert skip_if_unbuilt(model.eval) is model
-    bns = [layer for layer in model.layers if isinstance(layer, BatchNorm2d)]
-    assert bns, "ConvNet deve conter camadas BatchNorm2d."
-    assert all(b.training is False for b in bns), "eval() deve propagar o estado para o BatchNorm."
-    skip_if_unbuilt(model.train)
-    assert all(b.training is True for b in bns), "train() deve propagar o estado para o BatchNorm."
+def test_2d_chain_backward():
+    x = Tensor([[1.0, -2.0], [3.0, 4.0]])
+    z = (x * 2.0).relu()
+    z.backward()
+    expected = 2.0 * (x.data > 0)
+    assert np.allclose(x.grad, expected)
+    assert x.grad.shape == x.data.shape
 
 
-# ---------------------------------------------------------------------------
-# Gradcheck end-to-end na rede completa
-# ---------------------------------------------------------------------------
-def test_convnet_end_to_end_gradcheck():
-    in_shape = (3, 8, 8)
-    n_classes = 3
-    B = 4
-    model = skip_if_unbuilt(
-        ConvNet, in_shape, n_classes, channels=(2, 3), hidden=4, seed=7
-    )
-    X = RNG.standard_normal((B, *in_shape))
-    y = RNG.integers(0, n_classes, size=B)
-    params = skip_if_unbuilt(model.parameters)
-
-    def loss_value():
-        model.zero_grad()
-        logits = model(X)
-        return cross_entropy_loss(logits, y)
-
-    loss = skip_if_unbuilt(loss_value)
-    skip_if_unbuilt(loss.backward)
-    analytic = [np.array(p.grad, dtype=float) for p in params]
-
-    rng = np.random.default_rng(123)
-    for p, g_an in zip(params, analytic):
-        flat = p.data.reshape(-1)
-        n = flat.size
-        probes = rng.choice(n, size=min(3, n), replace=False)
-        for j in probes:
-            orig = flat[j]
-            flat[j] = orig + EPS
-            fp = scalar(loss_value())
-            flat[j] = orig - EPS
-            fm = scalar(loss_value())
-            flat[j] = orig
-            num = (fp - fm) / (2 * EPS)
-            an = g_an.reshape(-1)[j]
-            assert abs(an - num) <= ATOL_E2E + RTOL * abs(num), (
-                f"Falha no gradcheck end-to-end: analytic={an:.3e} "
-                f"numeric={num:.3e} (param shape {p.data.shape}, idx {j})."
-            )
+# --------------------------------------------------------------------------- #
+# matmul (@): forward value + gradient rule dL/dA = G@B.T, dL/dB = A.T@G
+# --------------------------------------------------------------------------- #
+def test_matmul_forward():
+    A = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    B = Tensor([[5.0, 6.0], [7.0, 8.0]])
+    C = A @ B
+    assert np.allclose(C.data, np.array([[1.0, 2.0], [3.0, 4.0]]) @ np.array([[5.0, 6.0], [7.0, 8.0]]))
+    assert C._op == "@"
+    assert set(C._prev) == {A, B}
 
 
-# ---------------------------------------------------------------------------
-# Métricas e convergência sintética
-# ---------------------------------------------------------------------------
-def test_accuracy_matches_numpy():
-    logits = RNG.standard_normal((20, 5))
-    y = RNG.integers(0, 5, size=20)
-    ref = float((np.argmax(logits, axis=1) == y).mean())
-    got = skip_if_unbuilt(accuracy, make_tensor(logits), y)
-    assert abs(got - ref) < 1e-12, f"accuracy={got}, esperava {ref}"
+def test_matmul_backward_2d():
+    A = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])   # (2,3)
+    B = Tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])  # (3,2)
+    C = A @ B                                          # (2,2)
+    C.backward()                                       # seeds G = ones((2,2))
+    G = np.ones((2, 2))
+    assert np.allclose(A.grad, G @ B.data.T), "dL/dA must equal G @ B.T"
+    assert np.allclose(B.grad, A.data.T @ G), "dL/dB must equal A.T @ G"
+    assert A.grad.shape == A.data.shape and B.grad.shape == B.data.shape
 
 
-def test_make_cifar_like_shapes():
-    X, y = skip_if_unbuilt(
-        make_cifar_like, n_per_class=6, img_size=16, n_classes=4, seed=0
-    )
-    assert X.shape == (24, 3, 16, 16), f"Formato inesperado em X: {X.shape}"
-    assert y.shape == (24,), f"Formato inesperado em y: {y.shape}"
-    assert set(np.unique(y).tolist()) == {0, 1, 2, 3}, "Os rótulos devem cobrir todas as classes."
+def test_matmul_vector_cases():
+    # (n,) @ (n,m) -> (m,)  : the dense-layer single-example case
+    x = Tensor([1.0, 2.0])               # (2,)
+    W = Tensor([[1.0, 0.0, 2.0], [0.0, 3.0, 1.0]])  # (2,3)
+    y = x @ W                            # (3,)
+    assert np.allclose(y.data, x.data @ W.data)
+    y.backward()
+    assert x.grad.shape == x.data.shape and W.grad.shape == W.data.shape
 
 
-@pytest.mark.slow
-def test_train_cifar_converges_and_records_lr():
-    X, y = skip_if_unbuilt(
-        make_cifar_like, n_per_class=24, img_size=16, n_classes=3,
-        noise=0.2, seed=3,
-    )
-    ds = skip_if_unbuilt(Dataset, X, y)
-    loader = skip_if_unbuilt(DataLoader, ds, batch_size=12, shuffle=True, seed=3)
-    model = skip_if_unbuilt(
-        ConvNet, (3, 16, 16), 3, channels=(8, 16), hidden=32, seed=3
-    )
-    hist = skip_if_unbuilt(
-        train_cifar, model, loader, epochs=8, base_lr=2e-3, schedule="cosine"
-    )
+def test_matmul_vector_dot_produces_scalar_backward():
+    # (n,) @ (n,) -> 0-d scalar : the Neuron's `x @ w` single-example pre-activation.
+    # backward must NOT do `result.grad @ other.data.T` blindly: when result is 0-d
+    # that crashes ("Input operand 0 does not have enough dimensions"). For a dot
+    # product z = a . b the grads are dz/da = b, dz/db = a (seeded with ones -> 1.0).
+    a = Tensor([1.0, 2.0, 3.0])
+    b = Tensor([4.0, 5.0, 6.0])
+    z = a @ b                             # 0-d
+    assert z.shape == ()
+    assert np.isclose(float(z.data), 1 * 4 + 2 * 5 + 3 * 6)
+    z.backward()                          # seeds G = 1.0 (0-d)
+    assert np.allclose(a.grad, b.data), "dL/da of a.b must equal b"
+    assert np.allclose(b.grad, a.data), "dL/db of a.b must equal a"
+    assert a.grad.shape == a.data.shape and b.grad.shape == b.data.shape
 
-    losses = hist["train_loss"]
-    assert losses[-1] < losses[0], (
-        f"A perda de treino deve diminuir: primeira={losses[0]:.3f} "
-        f"última={losses[-1]:.3f}"
-    )
-    assert len(hist["lr"]) == hist["steps"], "O lr deve ser gravado a cada step."
-    assert hist["lr"][0] >= hist["lr"][-1] - 1e-12, "O cosine_lr deve decair ao longo dos passos."
 
-    model.eval()
-    logits = skip_if_unbuilt(model, X)
-    acc = skip_if_unbuilt(accuracy, logits, y)
-    assert acc >= 0.85, f"Esperava acurácia de treino >= 0.85, obteve {acc:.3f}"
+def test_matmul_vector_right_batched():
+    # (b,n) @ (n,) -> (b,) : a batch of rows against one weight vector.
+    X = Tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])  # (3,2)
+    w = Tensor([0.5, -1.0])                            # (2,)
+    y = X @ w                                          # (3,)
+    assert y.shape == (3,)
+    assert np.allclose(y.data, X.data @ w.data)
+    y.backward()                                       # seeds G = ones((3,))
+    assert np.allclose(X.grad, np.outer(np.ones(3), w.data)), "dL/dX must be outer(G, w)"
+    assert np.allclose(w.grad, X.data.T @ np.ones(3)), "dL/dw must be X.T @ G"
+    assert X.grad.shape == X.data.shape and w.grad.shape == w.data.shape
+
+
+def test_matmul_gradcheck_central_difference():
+    # Independent numeric check of matmul backward — perturb every entry of A
+    # and B and compare the slope of sum(A@B) against the autodiff grads.
+    rng = np.random.default_rng(0)
+    A0 = rng.standard_normal((2, 3))
+    B0 = rng.standard_normal((3, 2))
+    A, B = Tensor(A0), Tensor(B0)
+    (A @ B).backward()                                 # seeds G = ones((2,2))
+
+    for arr, tensor in ((A0, A), (B0, B)):
+        num = np.zeros_like(arr)
+        it = np.nditer(arr, flags=["multi_index"])
+        while not it.finished:
+            idx = it.multi_index
+            orig = arr[idx]
+            arr[idx] = orig + EPS
+            fp = float(np.sum(A0 @ B0))
+            arr[idx] = orig - EPS
+            fm = float(np.sum(A0 @ B0))
+            arr[idx] = orig
+            num[idx] = (fp - fm) / (2 * EPS)
+            it.iternext()
+        assert np.allclose(tensor.grad, num, rtol=1e-4, atol=TOL)
+
+
+# --------------------------------------------------------------------------- #
+# reshape: pure rearrangement, grad flows back under the inverse reshape
+# --------------------------------------------------------------------------- #
+def test_reshape_forward_varargs():
+    x = Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    z = x.reshape(2, 3)
+    assert z.shape == (2, 3)
+    assert np.allclose(z.data, np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+
+
+def test_reshape_forward_tuple():
+    # must accept a single tuple arg too: t.reshape((2, 3))
+    x = Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    z = x.reshape((3, 2))
+    assert z.shape == (3, 2)
+    assert np.allclose(z.data, x.data.reshape(3, 2))
+
+
+def test_reshape_minus_one_flattens():
+    x = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    z = x.reshape(-1)                       # NumPy infers the (4,) shape
+    assert z.shape == (4,)
+    assert np.allclose(z.data, [1.0, 2.0, 3.0, 4.0])
+
+
+def test_reshape_backward_routes_grad_to_original_shape():
+    x = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # (2,3)
+    z = x.reshape(6)                                  # (6,)
+    z.backward()                                      # seeds ones((6,))
+    # pure rearrangement: every grad entry is 1, reshaped back to x's shape
+    assert x.grad.shape == x.data.shape
+    assert np.allclose(x.grad, np.ones((2, 3)))
+
+
+def test_reshape_backward_through_op_preserves_values():
+    # grad must travel the inverse reshape with the RIGHT per-entry values,
+    # not just the right shape. Square after reshape so dz/dx = 2x, then
+    # confirm each entry lands back in its original (2,2) slot.
+    x = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    z = (x.reshape(4) ** 2)                 # (4,), entrywise x**2
+    z.backward()
+    assert np.allclose(x.grad, 2.0 * x.data)
+    assert x.grad.shape == x.data.shape
+
+
+def test_reshape_records_graph():
+    x = Tensor([1.0, 2.0, 3.0, 4.0])
+    z = x.reshape(2, 2)
+    assert z._prev == (x,)
+
+
+# --------------------------------------------------------------------------- #
+# transpose: axis reversal, grad flows back under the inverse transpose
+# --------------------------------------------------------------------------- #
+def test_transpose_forward_and_graph():
+    x = Tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])   # (2,3)
+    z = x.transpose()
+    assert z.shape == (3, 2)
+    assert np.allclose(z.data, x.data.T)
+    assert z._prev == (x,)
+
+
+def test_T_property_matches_transpose():
+    x = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    assert np.allclose(x.T.data, x.data.T)
+
+
+def test_transpose_backward_routes_grad():
+    # square after transpose so dz/dx = 2x must land back in the original slots
+    x = Tensor([[1.0, 2.0], [3.0, 4.0]])
+    z = x.transpose() ** 2
+    z.backward()
+    assert np.allclose(x.grad, 2.0 * x.data)
+    assert x.grad.shape == x.data.shape
+
+
+def test_transpose_in_matmul_attention_pattern():
+    # the Q @ K.T pattern stage_28 self-attention is built on
+    Q = Tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])   # (3,2)
+    K = Tensor([[0.5, -1.0], [2.0, 0.0], [1.0, 1.0]])  # (3,2)
+    S = Q @ K.T                                         # (3,3)
+    assert np.allclose(S.data, Q.data @ K.data.T)
+    S.backward()                                        # seeds G = ones((3,3))
+    G = np.ones((3, 3))
+    assert np.allclose(Q.grad, G @ K.data), "dL/dQ of Q@K.T must equal G @ K"
+    assert np.allclose(K.grad, G.T @ Q.data), "dL/dK of Q@K.T must equal G.T @ Q"
+
+
+# --------------------------------------------------------------------------- #
+# gradient accumulation on reused nodes
+# --------------------------------------------------------------------------- #
+def test_reuse_accumulates_array():
+    x = Tensor([1.0, 2.0, 3.0])
+    z = x * x + x          # dz/dx = 2x + 1
+    z.backward()
+    assert np.allclose(x.grad, 2.0 * np.array([1.0, 2.0, 3.0]) + 1.0)
+
+
+def test_reuse_accumulates_scalar():
+    x = Tensor(2.0)
+    # f = x*x*x + x*x  ->  f' = 3x^2 + 2x = 12 + 4 = 16
+    z = x * x * x + x * x
+    z.backward()
+    assert np.isclose(float(x.grad), 16.0)
+
+
+def test_shared_subexpression():
+    a = Tensor(3.0)
+    b = a + 1.0           # 4
+    c = a * 2.0           # 6
+    out = b * c           # 24 ; d/da = (a+1)*2 + 2a = 2a+2+2a = 4a+2 = 14
+    out.backward()
+    assert np.isclose(float(a.grad), 14.0)
+
+
+# --------------------------------------------------------------------------- #
+# graph plumbing
+# --------------------------------------------------------------------------- #
+def test_prev_and_op_recorded():
+    x = Tensor(1.0)
+    y = Tensor(2.0)
+    z = x + y
+    assert set(z._prev) == {x, y} or set(z._prev) == {y, x}
+    assert z._op == "+"
+    p = x ** 2
+    assert p._op == "**"
+    assert p._prev == (x,)
+    r = x.relu()
+    assert r._op == "relu"
+
+
+def test_backward_seeds_output_with_ones():
+    x = Tensor([1.0, 2.0])
+    y = x * 1.0
+    y.backward()
+    # grad of y wrt itself is ones -> grad flows as ones into x (since *1)
+    assert np.allclose(x.grad, np.ones(2))
+
+
+def test_zero_grad_resets():
+    x = Tensor([1.0, 2.0, 3.0])
+    z = x * x
+    z.backward()
+    assert not np.allclose(x.grad, 0.0)
+    x.zero_grad()
+    assert np.allclose(x.grad, 0.0)
+    assert x.grad.shape == x.data.shape
+
+
+def test_numbers_on_both_sides():
+    x = Tensor(4.0)
+    out = 10.0 - x / 2.0 + 1.0   # = 10 - 2 + 1 = 9 ; d/dx = -0.5
+    assert np.isclose(float(out.data), 9.0)
+    out.backward()
+    assert np.isclose(float(x.grad), -0.5)
