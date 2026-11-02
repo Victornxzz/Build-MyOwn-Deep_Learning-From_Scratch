@@ -71,6 +71,10 @@ class Tensor:
     def T(self) -> "Tensor":
         return self.transpose()
 
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
     @staticmethod
     def _accumulate(grad_into: "Tensor", incoming: np.ndarray) -> None:
         if grad_into.shape == ():
