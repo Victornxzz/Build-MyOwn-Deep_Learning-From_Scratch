@@ -263,6 +263,57 @@ class Tensor:
         other_t = self._coerce(other)
         return self * other_t
 
+    def sum(self, axis: Union[None, int, Tuple[int, ...]] = None, keepdims: bool = False) -> "Tensor":
+        out_data = np.sum(self.data, axis=axis, keepdims=keepdims)
+        out = self._make_tensor(out_data, _prev=(self,), _op="sum")
+
+        def _backward():
+            grad = out.grad
+            if not keepdims and axis is not None:
+                axes = (axis,) if isinstance(axis, int) else axis
+                shape_restored = list(grad.shape)
+                for a in sorted([a if a >= 0 else a + len(self.shape) for a in axes]):
+                    shape_restored.insert(a, 1)
+                grad = grad.reshape(shape_restored)
+            elif not keepdims and axis is None:
+                grad = grad.reshape((1,) * len(self.shape))
+
+            grad_broadcasted = np.broadcast_to(grad, self.shape)
+            Tensor._accumulate(self, grad_broadcasted)
+
+        out._backward = _backward
+        return out
+
+    def mean(self, axis: Union[None, int, Tuple[int, ...]] = None, keepdims: bool = False) -> "Tensor":
+        out_data = np.mean(self.data, axis=axis, keepdims=keepdims)
+        out = self._make_tensor(out_data, _prev=(self,), _op="mean")
+
+        if axis is None:
+            num_elements = self.data.size
+        else:
+            axes = (axis,) if isinstance(axis, int) else axis
+            num_elements = 1
+            for a in axes:
+                num_elements *= self.shape[a]
+
+        def _backward():
+            grad = out.grad
+            if not keepdims and axis is not None:
+                axes = (axis,) if isinstance(axis, int) else axis
+                shape_restored = list(self.shape)
+                for a in axes:
+                    axis_idx = a if a >= 0 else a + len(self.shape)
+                    shape_restored[axis_idx] = 1
+                grad = grad.reshape(shape_restored)
+            elif not keepdims and axis is None:
+                grad = grad.reshape((1,) * len(self.shape))
+
+            grad_broadcasted = np.broadcast_to(grad, self.shape) / num_elements
+            Tensor._accumulate(self, grad_broadcasted)
+
+        out._backward = _backward
+        return out
+
     def backward(self) -> None:
         topo: List[Tensor] = []
         visited: Set[Tensor] = set()
