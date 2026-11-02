@@ -1,3 +1,4 @@
+from typing import Sequence, Optional
 import numpy as np
 from src.tensor import Tensor
 
@@ -49,7 +50,7 @@ class Dense:
             n_in: int,
             n_out: int,
             bias: bool = True,
-            seed: int | None = None,
+            seed: Optional[int] = None,
     ) -> None:
         self.n_in = n_in
         self.n_out = n_out
@@ -62,7 +63,7 @@ class Dense:
 
         if self.use_bias:
             b_data = np.zeros((n_out), dtype=np.float64)
-            self.b: Tensor | None = Tensor(b_data)
+            self.b = Tensor(b_data)
         else:
             self.b = None
 
@@ -70,27 +71,16 @@ class Dense:
 
         if not isinstance(x, Tensor):
             raise TypeError(f"Expected input x to be a Tensor, got {type(x)}")
-        
+
         is_1d = x.ndim == 1
 
-        if is_1d:
-            x_2d = x.reshape(1, self.n_in)
-        else:
-            x_2d = x
-
+        x_2d = x.reshape(1, self.n_in) if is_1d else x
         z = x_2d @ self.W
 
         if self.use_bias and self.b is not None:
-            batch_size = z.shape[0]
-            ones = Tensor(np.ones((batch_size, 1), dtype=np.float64))
-            b_row = self.b.reshape(1, self.n_out)
-            bias_expanded = ones @ b_row
-            z = z + bias_expanded
+            z = z + self.b
 
-        if is_1d:
-            return z.reshape(self.n_out)
-
-        return z
+        return z.reshape(self.n_out) if is_1d else z
 
     def parameters(self) -> list[Tensor]:
 
@@ -104,3 +94,62 @@ class Dense:
 
     def __repr__(self) -> str:
         return f"Dense(n_in={self.n_in}, n_out={self.n_out}, bias={self.use_bias})"
+
+
+class MLP:
+    def __init__(
+            self,
+            sizes: Sequence[int],
+            activation: str = "tanh",
+            out_activation: str = "none",
+            seed: Optional[int] = None,
+    ) -> None:
+        if len(sizes) < 2:
+            raise ValueError("MLP demands in and out sizes (len >= 2)")
+
+        valid_acts = {"tanh", "relu", "none"}
+        if activation not in valid_acts or out_activation not in valid_acts:
+            raise ValueError(f"Activations must be include one of {valid_acts}")
+
+        self.sizes = sizes
+        self.activation = activation
+        self.out_activation = out_activation
+        self.layers = []
+
+        for i in range(len(sizes) - 1):
+            s = seed + i if seed is not None else None
+            self.layers.append(Dense(sizes[i], sizes[i + 1], bias=True, seed=s))
+
+    @staticmethod
+    def _apply_activation(z: Tensor, name: str) -> Tensor:
+        if name == "tanh":
+            return z.tanh()
+        elif name == "relu":
+            return z.relu()
+        elif name == "none":
+            return z
+        raise ValueError(f"Unknown activation: {name}")
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = x
+        for i, layer in enumerate(self.layers):
+            out = layer(out)
+            act_name = self.out_activation if i == len(self.layers) - 1 else self.activation
+            out = self._apply_activation(out, act_name)
+        return out
+
+    def __call__(self, x: Tensor) -> Tensor:
+        return self.forward(x)
+
+    def parameters(self) -> list[Tensor]:
+        params = []
+        for layer in self.layers:
+            params.extend(layer.parameters())
+        return params
+
+    def zero_grad(self) -> None:
+        for p in self.parameters():
+            p.zero_grad()
+
+    def __repr__(self) -> str:
+        return f"MLP(sizes={self.sizes}, activation='{self.activation}', out_activation='{self.out_activation}')"

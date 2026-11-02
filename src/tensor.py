@@ -26,7 +26,24 @@ class Tensor:
         return type(self)(*args, **kwargs)
 
     def _coerce(self, other: Operand)-> "Tensor":
-        return other if isinstance(other, Tensor) else self._make_tensor(other)
+        if isinstance(other, type(self)):
+            return other    
+        if hasattr(other, 'data'):
+            return self._make_tensor(other.data)
+        return self._make_tensor(other)
+
+    @staticmethod
+    def _unbroadcast(grad: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+        res = grad
+
+        while res.ndim > len(shape):
+            res = res.sum(axis=0)
+
+        for i, dim in enumerate(shape):
+            if dim == 1 and res.shape[i] > 1:
+                res = res.sum(axis=i, keepdims=True)
+
+        return res.reshape(shape)
 
     @classmethod
     def from_value(cls, v: Any) -> "Tensor":
@@ -91,8 +108,8 @@ class Tensor:
         )
 
         def _backward():
-            Tensor._accumulate(self, out.grad)
-            Tensor._accumulate(other_t, out.grad)
+            Tensor._accumulate(self, Tensor._unbroadcast(out.grad, self.shape))
+            Tensor._accumulate(other_t, Tensor._unbroadcast(out.grad, other_t.shape))
 
         out._backward = _backward
         return out
@@ -106,8 +123,10 @@ class Tensor:
         )
 
         def _backward():
-            Tensor._accumulate(self, out.grad * other_t.data)
-            Tensor._accumulate(other_t, out.grad * self.data)
+            grad_self = out.grad * other_t.data
+            grad_other = out.grad * self.data
+            Tensor._accumulate(self, Tensor._unbroadcast(grad_self, self.shape))
+            Tensor._accumulate(other_t, Tensor._unbroadcast(grad_other, other_t.shape))
 
         out._backward = _backward
         return out
@@ -223,10 +242,12 @@ class Tensor:
         return self * -1.0
 
     def __sub__(self, other: Operand) -> "Tensor":
-        return self + (-self._coerce(other))
+        other_t = self._coerce(other)
+        return self + (-self._coerce(other_t))
 
     def __rsub__(self, other: Operand) -> "Tensor":
-        return self._coerce(other) + (-self)
+        other_t = self._coerce(other)
+        return self._coerce(other_t) + (-self)
 
     def __truediv__(self, other: Operand) -> "Tensor":
         return self * (self._coerce(other) ** -1.0)
@@ -235,10 +256,12 @@ class Tensor:
         return self._coerce(other) * (self ** -1.0)
 
     def __radd__(self, other: Operand) -> "Tensor":
-        return self + other
+        other_t = self._coerce(other)
+        return self + other_t
 
     def __rmul__(self, other: Operand) -> "Tensor":
-        return self * other
+        other_t = self._coerce(other)
+        return self * other_t
 
     def backward(self) -> None:
         topo: List[Tensor] = []
