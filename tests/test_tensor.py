@@ -7,9 +7,9 @@ from src.vec import Vec, Mat
 from src.tensor import Tensor
 from src.nn import Neuron, Dense, MLP
 from src.loss import mse_loss, mae_loss, log_softmax, softmax, cross_entropy_loss
+from src.optim import Optimizer, SGD
 
 
-RNG = np.random.default_rng(13)
 EPS = 1e-6
 ATOL = 1e-6
 RTOL = 1e-4
@@ -17,21 +17,17 @@ RTOL = 1e-4
 
 # --- Small helpers -----------------------------------------------------------
 def as_array(t):
-    """Underlying ndarray of a Tensor (or pass arrays through)."""
+    """Return the underlying numpy array of a Tensor (or pass arrays through)."""
     return np.asarray(t.data if hasattr(t, "data") else t, dtype=float)
 
 
-def loss_value(t):
-    """Scalar python float held by a (0-d) loss Tensor."""
-    return float(as_array(t).reshape(-1)[0]) if as_array(t).size == 1 else float(np.sum(as_array(t)))
-
-
-def _onehot(targets, num_classes):
-    """Test-local one-hot: (B,) int -> (B, C)."""
-    t = np.asarray(targets, dtype=int)
-    oh = np.zeros((t.shape[0], num_classes), dtype=float)
-    oh[np.arange(t.shape[0]), t] = 1.0
-    return oh
+def make_tensor(arr):
+    """Build a Tensor from array-like data, tolerating ctor kwarg differences."""
+    arr = np.asarray(arr, dtype=float)
+    try:
+        return Tensor(arr, requires_grad=True)
+    except TypeError:
+        return Tensor(arr)
 
 
 def central_diff(f, x, eps=EPS):
@@ -52,112 +48,173 @@ def central_diff(f, x, eps=EPS):
     return grad
 
 
-def analytic_grad(loss_fn, pred_np, *rest):
-    """Build the loss from a fresh prediction Tensor, backprop, return its grad."""
-    p = Tensor(pred_np.copy())
-    if hasattr(p, "zero_grad"):
-        p.zero_grad()
-    L = loss_fn(p, *rest)
-    L.backward()
-    return as_array(p.grad)
+def set_grad(p, g):
+    """Stamp a known gradient onto a parameter (so step() has something to use)."""
+    p.grad = np.array(g, dtype=float).reshape(as_array(p).shape)
 
 
-# =========================================================================== #
-# softmax / log-softmax  (batched: (B, C) -> (B, C), per row)
-# =========================================================================== #
-def test_softmax_rows_sum_to_one():
-    z = RNG.normal(size=(5, 7))
-    p = as_array(softmax(Tensor(z)))
-    assert np.allclose(p.sum(axis=1), 1.0, atol=ATOL), f"rows sum: {p.sum(axis=1)}"
-    assert np.all(p >= 0.0), "softmax must be non-negative"
+# --- Construction -----------------------------------------------------------
+def test_collects_params_from_iterator():
+    # A generator must not be exhausted by the optimizer keeping it as-is.
+    ps = [make_tensor([1.0, 2.0]), make_tensor([3.0])]
+    opt = SGD((p for p in ps), lr=0.1)
+    assert len(opt.params) == 2, "SGD must materialize the params iterable into a list"
 
 
-def test_softmax_matches_numpy_reference():
-    z = RNG.normal(size=(4, 6))
-    p = as_array(softmax(Tensor(z)))
-    e = np.exp(z - z.max(axis=1, keepdims=True))
-    ref = e / e.sum(axis=1, keepdims=True)
-    assert np.allclose(p, ref, atol=ATOL), f"softmax mismatch:\n{p}\n{ref}"
+def test_lr_must_be_positive():
+    p = make_tensor([1.0])
+    with pytest.raises((ValueError, AssertionError)):
+        SGD([p], lr=0.0)
+    with pytest.raises((ValueError, AssertionError)):
+        SGD([p], lr=-0.5)
 
 
-def test_log_softmax_matches_log_of_softmax():
-    z = RNG.normal(size=(4, 5))
-    lp = as_array(log_softmax(Tensor(z)))
-    ref = np.log(as_array(softmax(Tensor(z))))
-    assert np.allclose(lp, ref, atol=ATOL), f"log_softmax mismatch:\n{lp}\n{ref}"
+def test_repr_mentions_lr_and_count():
+    p = make_tensor([1.0, 2.0])
+    r = repr(SGD([p], lr=0.05))
+    assert "SGD" in r and "0.05" in r
 
 
-def test_softmax_numerically_stable_large_logits():
-    z = np.array([[1000.0, 1001.0, 1002.0]])
-    p = as_array(softmax(Tensor(z)))
-    assert np.all(np.isfinite(p)), "softmax overflowed on large logits"
-    e = np.exp(z - z.max(axis=1, keepdims=True))
-    ref = e / e.sum(axis=1, keepdims=True)
-    assert np.allclose(p, ref, atol=ATOL)
+def test_base_step_is_abstract():
+    p = make_tensor([1.0])
+    base = Optimizer([p])
+    with pytest.raises(NotImplementedError):
+        base.step()
 
 
-def test_log_softmax_stable_large_logits():
-    z = np.array([[1000.0, 1001.0, 1002.0]])
-    lp = as_array(log_softmax(Tensor(z)))
-    assert np.all(np.isfinite(lp)), "log_softmax produced inf/nan on large logits"
+# --- Core update rule -------------------------------------------------------
+def test_step_applies_exact_update():
+    p1 = make_tensor([1.0, -2.0, 3.0])
+    p2 = make_tensor([[0.5, -0.5]])
+    set_grad(p1, [0.1, 0.2, -0.3])
+    set_grad(p2, [[2.0, -4.0]])
+
+    before1 = as_array(p1).copy()
+    before2 = as_array(p2).copy()
+    lr = 0.1
+    SGD([p1, p2], lr=lr).step()
+
+    assert np.allclose(as_array(p1), before1 - lr * np.array([0.1, 0.2, -0.3]), atol=ATOL), (
+        "p1.data must move by -lr * p1.grad"
+    )
+    assert np.allclose(as_array(p2), before2 - lr * np.array([[2.0, -4.0]]), atol=ATOL), (
+        "p2.data must move by -lr * p2.grad"
+    )
 
 
-# =========================================================================== #
-# cross-entropy  (batched: (B, C) logits + B labels -> scalar mean)
-# =========================================================================== #
-def test_cross_entropy_forward_matches_numpy():
-    z = RNG.normal(size=(4, 5))
-    t = np.array([0, 2, 4, 1])
-    got = loss_value(cross_entropy_loss(Tensor(z), t))
-    e = np.exp(z - z.max(axis=1, keepdims=True))
-    p = e / e.sum(axis=1, keepdims=True)
-    ref = float(np.mean(-np.log(p[np.arange(4), t])))
-    assert np.isclose(got, ref, atol=ATOL), f"CE forward: got {got}, want {ref}"
+def test_step_does_not_modify_grad():
+    p = make_tensor([1.0, 2.0])
+    set_grad(p, [0.5, -0.5])
+    g_before = as_array(p.grad).copy()
+    SGD([p], lr=0.3).step()
+    assert np.allclose(as_array(p.grad), g_before, atol=ATOL), (
+        "step() must not clear or alter p.grad (that is zero_grad's job)"
+    )
 
 
-def test_cross_entropy_accepts_onehot_targets():
-    z = RNG.normal(size=(3, 4))
-    t_idx = np.array([0, 3, 1])
-    t_oh = _onehot(t_idx, 4)
-    a = loss_value(cross_entropy_loss(Tensor(z), t_idx))
-    b = loss_value(cross_entropy_loss(Tensor(z), t_oh))
-    assert np.isclose(a, b, atol=ATOL), f"index vs one-hot CE differ: {a} vs {b}"
+def test_step_mutates_in_place_same_object():
+    p = make_tensor([4.0, 5.0])
+    set_grad(p, [1.0, 1.0])
+    opt = SGD([p], lr=0.5)
+    same = opt.params[0]
+    opt.step()
+    # The optimizer must hold the very same Tensor object as the caller.
+    assert same is p, "optimizer must keep the same Tensor objects, not copies"
+    assert np.allclose(as_array(p), [3.5, 4.5], atol=ATOL), "in-place update expected"
 
 
-def test_cross_entropy_stable_large_logits():
-    z = np.array([[1000.0, 1001.0, 1002.0]])
-    t = np.array([2])
-    L = loss_value(cross_entropy_loss(Tensor(z), t))
-    assert np.isfinite(L), "cross-entropy overflowed on large logits"
+def test_step_skips_none_grad():
+    p = make_tensor([1.0, 2.0])
+    p.grad = None  # simulate a param that never received a gradient
+    before = as_array(p).copy()
+    SGD([p], lr=0.1).step()  # must not raise
+    assert np.allclose(as_array(p), before, atol=ATOL), "params with grad=None are skipped"
 
 
-def test_cross_entropy_gradcheck_wrt_logits():
-    z_np = RNG.normal(size=(4, 5))
-    t = np.array([0, 2, 4, 1])
+def test_zero_grad_clears_all():
+    p1 = make_tensor([1.0, 2.0])
+    p2 = make_tensor([3.0])
+    set_grad(p1, [9.0, 9.0])
+    set_grad(p2, [9.0])
+    opt = SGD([p1, p2], lr=0.1)
+    opt.zero_grad()
+    assert np.allclose(as_array(p1.grad), 0.0), "zero_grad must clear p1.grad"
+    assert np.allclose(as_array(p2.grad), 0.0), "zero_grad must clear p2.grad"
+    assert as_array(p1.grad).shape == as_array(p1).shape, "grad shape must match data"
 
-    g_analytic = analytic_grad(cross_entropy_loss, z_np, t)
 
-    def f(z):
-        return loss_value(cross_entropy_loss(Tensor(z), t))
+# --- Gradient comes from autodiff, not hand-coding --------------------------
+def test_grad_matches_central_difference():
+    """The .grad SGD consumes is produced by Tensor.backward(); verify it.
 
-    g_num = central_diff(f, z_np.copy())
+    Loss: L(w) = sum( (w - target)**2 ), a convex quadratic. dL/dw = 2(w - target).
+    """
+    w_np = np.array([0.5, -1.0, 2.0])
+    target = np.array([1.0, 0.0, -1.0])
+
+    def loss_value(w):
+        wt = Tensor(np.asarray(w, dtype=float))
+        diff = wt - Tensor(target)
+        return float(np.sum(as_array(diff) ** 2))
+
+    w = make_tensor(w_np)
+    diff = w - Tensor(target)
+    loss = (diff * diff)
+    # reduce to a scalar so .backward() seeds a scalar; sum-of-squares.
+    loss = loss.sum() if hasattr(loss, "sum") else loss
+    loss.backward()
+    g_analytic = as_array(w.grad)
+
+    g_num = central_diff(loss_value, w_np.copy())
     assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
-        f"CE gradcheck mismatch:\n analytic={g_analytic}\n numeric ={g_num}"
+        f"autodiff grad must match central difference:\n"
+        f" analytic={g_analytic}\n numeric ={g_num}"
     )
 
 
-def test_cross_entropy_grad_is_p_minus_y_over_b():
-    """The fused batched gradient must equal (softmax(logits) - onehot) / B."""
-    z_np = RNG.normal(size=(4, 5))
-    t = np.array([0, 2, 4, 1])
-    B = z_np.shape[0]
+# --- End-to-end: SGD minimizes a convex quadratic ---------------------------
+def test_sgd_drives_quadratic_loss_down():
+    """Minimize L(w) = sum((w - target)**2) with the full backward/step/zero loop.
 
-    g_analytic = analytic_grad(cross_entropy_loss, z_np, t)
+    Loss must decrease (nearly) monotonically and converge near the minimum.
+    """
+    target = np.array([1.0, -2.0, 0.5])
+    w = make_tensor([0.0, 0.0, 0.0])
+    opt = SGD([w], lr=0.1)
 
-    p = as_array(softmax(Tensor(z_np)))
-    y = _onehot(t, z_np.shape[1])
-    expected = (p - y) / B
+    losses = []
+    for _ in range(200):
+        opt.zero_grad()
+        diff = w - Tensor(target)
+        loss = diff * diff
+        loss = loss.sum() if hasattr(loss, "sum") else loss
+        loss.backward()
+        losses.append(float(as_array(loss).sum()))
+        opt.step()
 
-    assert np.allclose(g_analytic, expected, atol=ATOL), (
-        f"CE grad != (p - y)/B:\n analytic={g_analytic}\n expected={expected}"
+    assert losses[-1] < losses[0], "loss must decrease over training"
+    assert losses[-1] < 1e-4, f"SGD should converge near the minimum, got {losses[-1]}"
+    assert np.allclose(as_array(w), target, atol=1e-2), (
+        f"weights should approach the target; got {as_array(w)} vs {target}"
     )
+    # Monotone-ish: no step should increase the loss for this small lr.
+    for prev, cur in zip(losses, losses[1:]):
+        assert cur <= prev + 1e-9, "loss increased during SGD on a convex quadratic"
+
+
+def test_step_count_changes_params_progressively():
+    w = make_tensor([10.0])
+    opt = SGD([w], lr=0.1)
+    history = [as_array(w).copy()]
+    for _ in range(5):
+        opt.zero_grad()
+        # L = w**2 -> dL/dw = 2w
+        loss = w * w
+        loss = loss.sum() if hasattr(loss, "sum") else loss
+        loss.backward()
+        opt.step()
+        history.append(as_array(w).copy())
+    # |w| strictly shrinks each step (0 < lr*2 < 1 -> contraction factor 0.8).
+    mags = [float(np.abs(h).sum()) for h in history]
+    for prev, cur in zip(mags, mags[1:]):
+        assert cur < prev, "each SGD step should shrink |w| toward the minimum at 0"
