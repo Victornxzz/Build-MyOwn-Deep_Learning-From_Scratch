@@ -8,213 +8,311 @@ from src.tensor import Tensor
 from src.nn import Neuron, Dense, MLP
 from src.loss import mse_loss, mae_loss, log_softmax, softmax, cross_entropy_loss
 from src.optim import Optimizer, SGD
+from src.trainer import accuracy, train, plot_history
 
 
 EPS = 1e-6
 ATOL = 1e-6
 RTOL = 1e-4
 
-
-# --- Small helpers -----------------------------------------------------------
-def as_array(t):
-    """Return the underlying numpy array of a Tensor (or pass arrays through)."""
-    return np.asarray(t.data if hasattr(t, "data") else t, dtype=float)
-
-
-def make_tensor(arr):
-    """Build a Tensor from array-like data, tolerating ctor kwarg differences."""
-    arr = np.asarray(arr, dtype=float)
+# --------------------------------------------------------------------------- #
+# helper: skip cleanly while a piece (this stage's TODOs or an earlier-stage
+# dependency) is still raising NotImplementedError.
+# --------------------------------------------------------------------------- #
+def _requires(fn, *args, **kwargs):
+    """Call fn; skip the test if a NotImplementedError bubbles up."""
     try:
-        return Tensor(arr, requires_grad=True)
-    except TypeError:
-        return Tensor(arr)
+        return fn(*args, **kwargs)
+    except NotImplementedError as e:
+        pytest.skip(f"depends on unimplemented piece: {e}")
 
 
-def central_diff(f, x, eps=EPS):
-    """Numerical gradient of scalar-valued f at numpy point x (any shape)."""
-    x = np.asarray(x, dtype=float)
-    grad = np.zeros_like(x)
-    it = np.nditer(x, flags=["multi_index"])
-    while not it.finished:
-        idx = it.multi_index
-        orig = x[idx]
-        x[idx] = orig + eps
-        fp = f(x)
-        x[idx] = orig - eps
-        fm = f(x)
-        x[idx] = orig
-        grad[idx] = (fp - fm) / (2 * eps)
-        it.iternext()
-    return grad
+def _T(data):
+    """Build a Tensor, skipping the test while the engine is unimplemented."""
+    return _requires(Tensor, data)
 
 
-def set_grad(p, g):
-    """Stamp a known gradient onto a parameter (so step() has something to use)."""
-    p.grad = np.array(g, dtype=float).reshape(as_array(p).shape)
+# --------------------------------------------------------------------------- #
+# toy-dataset fixtures: the data the loop is trained on
+# --------------------------------------------------------------------------- #
+def make_moons(n=200, noise=0.1, seed=None):
+    """Two interleaving half-moons: a 2-class problem no linear model solves.
 
-
-# --- Construction -----------------------------------------------------------
-def test_collects_params_from_iterator():
-    # A generator must not be exhausted by the optimizer keeping it as-is.
-    ps = [make_tensor([1.0, 2.0]), make_tensor([3.0])]
-    opt = SGD((p for p in ps), lr=0.1)
-    assert len(opt.params) == 2, "SGD must materialize the params iterable into a list"
-
-
-def test_lr_must_be_positive():
-    p = make_tensor([1.0])
-    with pytest.raises((ValueError, AssertionError)):
-        SGD([p], lr=0.0)
-    with pytest.raises((ValueError, AssertionError)):
-        SGD([p], lr=-0.5)
-
-
-def test_repr_mentions_lr_and_count():
-    p = make_tensor([1.0, 2.0])
-    r = repr(SGD([p], lr=0.05))
-    assert "SGD" in r and "0.05" in r
-
-
-def test_base_step_is_abstract():
-    p = make_tensor([1.0])
-    base = Optimizer([p])
-    with pytest.raises(NotImplementedError):
-        base.step()
-
-
-# --- Core update rule -------------------------------------------------------
-def test_step_applies_exact_update():
-    p1 = make_tensor([1.0, -2.0, 3.0])
-    p2 = make_tensor([[0.5, -0.5]])
-    set_grad(p1, [0.1, 0.2, -0.3])
-    set_grad(p2, [[2.0, -4.0]])
-
-    before1 = as_array(p1).copy()
-    before2 = as_array(p2).copy()
-    lr = 0.1
-    SGD([p1, p2], lr=lr).step()
-
-    assert np.allclose(as_array(p1), before1 - lr * np.array([0.1, 0.2, -0.3]), atol=ATOL), (
-        "p1.data must move by -lr * p1.grad"
-    )
-    assert np.allclose(as_array(p2), before2 - lr * np.array([[2.0, -4.0]]), atol=ATOL), (
-        "p2.data must move by -lr * p2.grad"
-    )
-
-
-def test_step_does_not_modify_grad():
-    p = make_tensor([1.0, 2.0])
-    set_grad(p, [0.5, -0.5])
-    g_before = as_array(p.grad).copy()
-    SGD([p], lr=0.3).step()
-    assert np.allclose(as_array(p.grad), g_before, atol=ATOL), (
-        "step() must not clear or alter p.grad (that is zero_grad's job)"
-    )
-
-
-def test_step_mutates_in_place_same_object():
-    p = make_tensor([4.0, 5.0])
-    set_grad(p, [1.0, 1.0])
-    opt = SGD([p], lr=0.5)
-    same = opt.params[0]
-    opt.step()
-    # The optimizer must hold the very same Tensor object as the caller.
-    assert same is p, "optimizer must keep the same Tensor objects, not copies"
-    assert np.allclose(as_array(p), [3.5, 4.5], atol=ATOL), "in-place update expected"
-
-
-def test_step_skips_none_grad():
-    p = make_tensor([1.0, 2.0])
-    p.grad = None  # simulate a param that never received a gradient
-    before = as_array(p).copy()
-    SGD([p], lr=0.1).step()  # must not raise
-    assert np.allclose(as_array(p), before, atol=ATOL), "params with grad=None are skipped"
-
-
-def test_zero_grad_clears_all():
-    p1 = make_tensor([1.0, 2.0])
-    p2 = make_tensor([3.0])
-    set_grad(p1, [9.0, 9.0])
-    set_grad(p2, [9.0])
-    opt = SGD([p1, p2], lr=0.1)
-    opt.zero_grad()
-    assert np.allclose(as_array(p1.grad), 0.0), "zero_grad must clear p1.grad"
-    assert np.allclose(as_array(p2.grad), 0.0), "zero_grad must clear p2.grad"
-    assert as_array(p1.grad).shape == as_array(p1).shape, "grad shape must match data"
-
-
-# --- Gradient comes from autodiff, not hand-coding --------------------------
-def test_grad_matches_central_difference():
-    """The .grad SGD consumes is produced by Tensor.backward(); verify it.
-
-    Loss: L(w) = sum( (w - target)**2 ), a convex quadratic. dL/dw = 2(w - target).
+    Returns ``(X, y)`` as Tensors: ``X`` of shape ``(n, 2)``, ``y`` of shape
+    ``(n, 1)`` with labels in ``{-1.0, +1.0}``.  ``y`` is a column on purpose:
+    it matches the model's ``(n, 1)`` output so ``pred - y`` never broadcasts
+    to ``(n, n)``.  Deterministic given ``seed``; ``noise`` is the per-point
+    Gaussian jitter.
     """
-    w_np = np.array([0.5, -1.0, 2.0])
-    target = np.array([1.0, 0.0, -1.0])
+    rng = np.random.default_rng(seed)
+    n_out = n // 2          # outer (upper) moon, label +1
+    n_in = n - n_out        # inner (lower) moon, label -1
 
-    def loss_value(w):
-        wt = Tensor(np.asarray(w, dtype=float))
-        diff = wt - Tensor(target)
-        return float(np.sum(as_array(diff) ** 2))
+    # Outer moon: upper half-circle centered at the origin.
+    t_out = np.linspace(0.0, np.pi, n_out)
+    x_out = np.stack([np.cos(t_out), np.sin(t_out)], axis=1)
 
-    w = make_tensor(w_np)
-    diff = w - Tensor(target)
-    loss = (diff * diff)
-    # reduce to a scalar so .backward() seeds a scalar; sum-of-squares.
-    loss = loss.sum() if hasattr(loss, "sum") else loss
-    loss.backward()
-    g_analytic = as_array(w.grad)
+    # Inner moon: lower half-circle, shifted right and down so the two interlock.
+    t_in = np.linspace(0.0, np.pi, n_in)
+    x_in = np.stack([1.0 - np.cos(t_in), 0.5 - np.sin(t_in)], axis=1)
 
-    g_num = central_diff(loss_value, w_np.copy())
-    assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
-        f"autodiff grad must match central difference:\n"
-        f" analytic={g_analytic}\n numeric ={g_num}"
-    )
+    X = np.concatenate([x_out, x_in], axis=0).astype(np.float64)
+    y = np.concatenate([np.ones(n_out), -np.ones(n_in)]).astype(np.float64)
+
+    X += rng.normal(0.0, noise, size=X.shape)
+    return Tensor(X), Tensor(y.reshape(-1, 1))
 
 
-# --- End-to-end: SGD minimizes a convex quadratic ---------------------------
-def test_sgd_drives_quadratic_loss_down():
-    """Minimize L(w) = sum((w - target)**2) with the full backward/step/zero loop.
+def make_spiral(n_per_class=100, n_classes=2, noise=0.2, seed=None):
+    """Interleaved spiral arms: a harder non-linearly-separable 2-class problem.
 
-    Loss must decrease (nearly) monotonically and converge near the minimum.
+    Returns ``(X, y)`` as Tensors: ``X`` of shape ``(n_per_class * n_classes, 2)``,
+    ``y`` of shape ``(n_per_class * n_classes, 1)`` in ``{-1.0, +1.0}`` (even
+    arms +1, odd arms -1).  Deterministic given ``seed``; ``noise`` jitters the
+    angle of each point.
     """
-    target = np.array([1.0, -2.0, 0.5])
-    w = make_tensor([0.0, 0.0, 0.0])
-    opt = SGD([w], lr=0.1)
+    rng = np.random.default_rng(seed)
+    X = np.zeros((n_per_class * n_classes, 2), dtype=np.float64)
+    y = np.zeros(n_per_class * n_classes, dtype=np.float64)
 
-    losses = []
-    for _ in range(200):
-        opt.zero_grad()
-        diff = w - Tensor(target)
-        loss = diff * diff
-        loss = loss.sum() if hasattr(loss, "sum") else loss
-        loss.backward()
-        losses.append(float(as_array(loss).sum()))
-        opt.step()
+    for c in range(n_classes):
+        idx = slice(c * n_per_class, (c + 1) * n_per_class)
+        r = np.linspace(0.0, 1.0, n_per_class)                       # radius 0 -> 1
+        # Each arm starts a full turn offset from the last; noise jitters the angle.
+        theta = (
+            np.linspace(c * 4.0, (c + 1) * 4.0, n_per_class)
+            + rng.normal(0.0, noise, size=n_per_class)
+        )
+        X[idx] = np.stack([r * np.sin(theta), r * np.cos(theta)], axis=1)
+        y[idx] = 1.0 if c % 2 == 0 else -1.0
 
-    assert losses[-1] < losses[0], "loss must decrease over training"
-    assert losses[-1] < 1e-4, f"SGD should converge near the minimum, got {losses[-1]}"
-    assert np.allclose(as_array(w), target, atol=1e-2), (
-        f"weights should approach the target; got {as_array(w)} vs {target}"
+    return Tensor(X), Tensor(y.reshape(-1, 1))
+
+
+# --------------------------------------------------------------------------- #
+# dataset fixtures: sanity of the contract the loop is built against
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("maker,kwargs,n_expected", [
+    (make_moons, dict(n=200, noise=0.1, seed=0), 200),
+    (make_moons, dict(n=201, noise=0.1, seed=0), 201),          # odd n splits fine
+    (make_spiral, dict(n_per_class=80, n_classes=2, noise=0.1, seed=1), 160),
+])
+def test_datasets_types_shapes_labels(maker, kwargs, n_expected):
+    X, y = _requires(maker, **kwargs)
+    assert isinstance(X, Tensor) and isinstance(y, Tensor)
+    assert X.shape == (n_expected, 2)
+    assert y.shape == (n_expected, 1), "y must be a (N, 1) column, not (N,)"
+    assert X.data.dtype == np.float64
+    labels = set(np.unique(y.data))
+    assert labels == {-1.0, 1.0}, f"labels must be exactly {{-1, +1}}, got {labels}"
+
+
+@pytest.mark.parametrize("maker,kwargs", [
+    (make_moons, dict(n=120, noise=0.1)),
+    (make_spiral, dict(n_per_class=60, noise=0.1)),
+])
+def test_datasets_deterministic_given_seed(maker, kwargs):
+    Xa, ya = _requires(maker, seed=7, **kwargs)
+    Xb, yb = _requires(maker, seed=7, **kwargs)
+    assert np.array_equal(Xa.data, Xb.data)
+    assert np.array_equal(ya.data, yb.data)
+    Xc, _ = _requires(maker, seed=8, **kwargs)
+    assert not np.allclose(Xa.data, Xc.data), "different seed must move the points"
+
+
+def test_make_moons_noise_jitters_points():
+    Xa, _ = _requires(make_moons, n=120, noise=0.0, seed=3)
+    Xb, _ = _requires(make_moons, n=120, noise=0.3, seed=3)
+    assert not np.allclose(Xa.data, Xb.data)
+
+
+# --------------------------------------------------------------------------- #
+# accuracy: off-graph sign agreement
+# --------------------------------------------------------------------------- #
+def test_accuracy_perfect_and_half():
+    pred = _T([[2.0], [-3.0], [0.7], [-0.1]])
+    y = _T([[1.0], [-1.0], [1.0], [-1.0]])
+    acc = _requires(accuracy, pred, y)
+    assert isinstance(acc, float)
+    assert np.isclose(acc, 1.0)
+    y_half = _T([[-1.0], [1.0], [1.0], [-1.0]])   # first two flipped
+    assert np.isclose(_requires(accuracy, pred, y_half), 0.5)
+
+
+def test_accuracy_mixed_types_and_shapes():
+    """Tensor or ndarray, (N, 1) or (N,) -- all four combinations agree."""
+    p_col = _T([[1.0], [-2.0], [3.0], [-4.0]])
+    y_flat = np.array([1.0, -1.0, -1.0, -1.0])
+    expected = 0.75
+    assert np.isclose(_requires(accuracy, p_col, y_flat), expected)
+    assert np.isclose(_requires(accuracy, p_col.data, y_flat), expected)
+    assert np.isclose(_requires(accuracy, p_col, _T(y_flat)), expected)
+    assert np.isclose(
+        _requires(accuracy, p_col.data.reshape(-1), _T(y_flat.reshape(-1, 1))),
+        expected,
     )
-    # Monotone-ish: no step should increase the loss for this small lr.
-    for prev, cur in zip(losses, losses[1:]):
-        assert cur <= prev + 1e-9, "loss increased during SGD on a convex quadratic"
 
 
-def test_step_count_changes_params_progressively():
-    w = make_tensor([10.0])
-    opt = SGD([w], lr=0.1)
-    history = [as_array(w).copy()]
+def test_accuracy_zero_prediction_counts_wrong():
+    pred = _T([[0.0], [1.0]])
+    y = _T([[1.0], [1.0]])
+    assert np.isclose(_requires(accuracy, pred, y), 0.5)
+
+
+def test_accuracy_size_mismatch_raises():
+    pred = _T([[1.0], [2.0], [3.0]])
+    y = _T([[1.0], [-1.0]])
+    with pytest.raises(ValueError):
+        _requires(accuracy, pred, y)
+
+
+def test_accuracy_is_off_graph():
+    """A metric must not touch grads or extend the graph."""
+    pred = _T([[2.0], [-1.0]])
+    y = _T([[1.0], [-1.0]])
+    _requires(accuracy, pred, y)
+    assert np.allclose(pred.grad, 0.0), "accuracy must not write grads"
+    assert np.allclose(y.grad, 0.0), "accuracy must not write grads"
+
+
+# --------------------------------------------------------------------------- #
+# train: the canonical loop, pinned against a hand-rolled reference
+# --------------------------------------------------------------------------- #
+def test_train_returns_history_dict():
+    X, y = _requires(make_moons, n=160, noise=0.1, seed=0)
+    model = _requires(MLP, [2, 16, 1], activation="tanh", seed=0)
+    history = _requires(train, model, X, y, lr=0.1, epochs=50)
+    assert set(history.keys()) == {"loss", "accuracy"}
+    assert len(history["loss"]) == 50
+    assert len(history["accuracy"]) == 50
+    assert all(isinstance(v, float) and np.isfinite(v) for v in history["loss"])
+    assert all(
+        isinstance(v, float) and 0.0 <= v <= 1.0 for v in history["accuracy"]
+    )
+
+
+def test_train_matches_manual_loop_exactly():
+    """train() for 5 epochs == a hand-rolled forward/loss/backward/step/zero
+    loop on an identically-seeded model.  This equality catches a shuffled
+    step order and any stray extra update (a missing zero_grad is caught by
+    test_train_leaves_grads_zeroed below)."""
+    X, y = _requires(make_moons, n=64, noise=0.1, seed=2)
+
+    model_a = _requires(MLP, [2, 8, 1], activation="tanh", seed=3)
+    history = _requires(train, model_a, X, y, lr=0.1, epochs=5)
+
+    model_b = _requires(MLP, [2, 8, 1], activation="tanh", seed=3)
+    opt = _requires(SGD, model_b.parameters(), lr=0.1)
+    manual_losses = []
     for _ in range(5):
-        opt.zero_grad()
-        # L = w**2 -> dL/dw = 2w
-        loss = w * w
-        loss = loss.sum() if hasattr(loss, "sum") else loss
+        pred = model_b(X)
+        loss = mse_loss(pred, y)
         loss.backward()
         opt.step()
-        history.append(as_array(w).copy())
-    # |w| strictly shrinks each step (0 < lr*2 < 1 -> contraction factor 0.8).
-    mags = [float(np.abs(h).sum()) for h in history]
-    for prev, cur in zip(mags, mags[1:]):
-        assert cur < prev, "each SGD step should shrink |w| toward the minimum at 0"
+        opt.zero_grad()
+        manual_losses.append(float(loss.data))
+
+    assert np.allclose(history["loss"], manual_losses, rtol=0, atol=0), (
+        "train() must be the canonical loop exactly:\n"
+        f" train ={history['loss']}\n manual={manual_losses}"
+    )
+    for p_a, p_b in zip(model_a.parameters(), model_b.parameters()):
+        assert np.array_equal(p_a.data, p_b.data), (
+            "parameters after train() differ from the manual loop "
+            "(zero_grad missing or step order wrong?)"
+        )
+
+
+def test_train_loss_decreases():
+    X, y = _requires(make_moons, n=160, noise=0.1, seed=0)
+    model = _requires(MLP, [2, 16, 1], activation="tanh", seed=0)
+    history = _requires(train, model, X, y, lr=0.1, epochs=50)
+    losses = history["loss"]
+    assert losses[-1] < losses[0]
+    assert losses[-1] < 0.9 * losses[0], "loss should drop meaningfully, not crawl"
+
+
+def test_train_uses_provided_optimizer_and_ignores_lr():
+    X, y = _requires(make_moons, n=120, noise=0.1, seed=0)
+    model = _requires(MLP, [2, 8, 1], activation="tanh", seed=0)
+    opt = _requires(SGD, model.parameters(), lr=0.05)
+    # lr=1e6 would explode instantly if train built its own optimizer from it.
+    history = _requires(train, model, X, y, lr=1e6, epochs=20, optimizer=opt)
+    assert len(history["loss"]) == 20
+    assert all(np.isfinite(v) for v in history["loss"])
+    assert history["loss"][-1] <= history["loss"][0]
+
+
+def test_train_leaves_grads_zeroed():
+    """The loop ends on zero_grad, so the caller can backward() fresh."""
+    X, y = _requires(make_moons, n=40, noise=0.1, seed=0)
+    model = _requires(MLP, [2, 4, 1], activation="tanh", seed=0)
+    _requires(train, model, X, y, lr=0.1, epochs=3)
+    for p in model.parameters():
+        assert np.allclose(p.grad, 0.0)
+        assert p.grad.shape == p.data.shape
+
+
+def test_train_accepts_flat_y_identically():
+    """y as (N,) must train exactly like the same y as (N, 1)."""
+    X, y = _requires(make_moons, n=60, noise=0.1, seed=1)
+    y_flat = Tensor(y.data.reshape(-1))
+
+    model_col = _requires(MLP, [2, 8, 1], activation="tanh", seed=4)
+    hist_col = _requires(train, model_col, X, y, lr=0.1, epochs=5)
+    model_flat = _requires(MLP, [2, 8, 1], activation="tanh", seed=4)
+    hist_flat = _requires(train, model_flat, X, y_flat, lr=0.1, epochs=5)
+
+    assert np.allclose(hist_col["loss"], hist_flat["loss"], rtol=0, atol=0), (
+        "(N,) y must be normalized to (N, 1) -- did pred - y broadcast to (N, N)?"
+    )
+
+
+def test_train_rejects_non_tensor_inputs():
+    X, y = _requires(make_moons, n=40, noise=0.1, seed=0)
+    model = _requires(MLP, [2, 8, 1], activation="tanh", seed=0)
+    with pytest.raises(Exception):
+        _requires(train, model, X.data, y, epochs=1)         # X is ndarray
+    with pytest.raises(Exception):
+        _requires(train, model, X, y.data, epochs=1)         # y is ndarray
+    with pytest.raises(Exception):
+        _requires(train, model, X.data, y.data, epochs=1)    # both
+
+
+def test_train_rejects_bad_shapes():
+    X, y = _requires(make_moons, n=40, noise=0.1, seed=0)
+    model = _requires(MLP, [2, 8, 1], activation="tanh", seed=0)
+    with pytest.raises(ValueError):
+        _requires(train, model, X, Tensor(np.ones((39, 1))), epochs=1)  # N mismatch
+    with pytest.raises(ValueError):
+        _requires(train, model, X, Tensor(np.ones((40, 2))), epochs=1)  # y not a column
+    with pytest.raises(ValueError):
+        _requires(train, model, Tensor(np.ones(40)), y, epochs=1)       # X not 2-D
+
+
+# --------------------------------------------------------------------------- #
+# end-to-end: the loop actually learns
+# --------------------------------------------------------------------------- #
+def test_train_fits_noiseless_moons():
+    X, y = _requires(make_moons, n=200, noise=0.0, seed=0)
+    model = _requires(MLP, [2, 16, 1], activation="tanh", seed=0)
+    history = _requires(train, model, X, y, lr=0.2, epochs=400)
+    final_acc = _requires(accuracy, model(X), y)
+    assert final_acc >= 0.90, (
+        f"expected >= 90% train accuracy on clean moons, got {final_acc:.3f}"
+    )
+    # the recorded history must agree with a fresh evaluation of the metric.
+    assert np.isclose(history["accuracy"][-1], final_acc, atol=0.05)
+
+
+# --------------------------------------------------------------------------- #
+# plot helper (provided): smoke test, skipped when matplotlib is absent
+# --------------------------------------------------------------------------- #
+def test_plot_history_saves_figure(tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    history = {"loss": [1.0, 0.5, 0.25], "accuracy": [0.5, 0.75, 1.0]}
+    out = tmp_path / "history.png"
+    fig = plot_history(history, path=str(out))
+    assert out.exists() and out.stat().st_size > 0
+    assert fig is not None
