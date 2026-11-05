@@ -9,310 +9,296 @@ from src.nn import Neuron, Dense, MLP
 from src.loss import mse_loss, mae_loss, log_softmax, softmax, cross_entropy_loss
 from src.optim import Optimizer, SGD
 from src.trainer import accuracy, train, plot_history
-
+from src.init import (
+    xavier_uniform,
+    xavier_normal,
+    he_normal,
+    he_uniform,
+    init_dense,
+    forward_activation_stats,
+)
 
 EPS = 1e-6
 ATOL = 1e-6
 RTOL = 1e-4
 
-# --------------------------------------------------------------------------- #
-# helper: skip cleanly while a piece (this stage's TODOs or an earlier-stage
-# dependency) is still raising NotImplementedError.
-# --------------------------------------------------------------------------- #
-def _requires(fn, *args, **kwargs):
-    """Call fn; skip the test if a NotImplementedError bubbles up."""
+
+# --- helpers -----------------------------------------------------------------
+def as_array(t):
+    """Underlying numpy array of a Tensor (or pass arrays straight through)."""
+    return np.asarray(t.data if hasattr(t, "data") else t, dtype=float)
+
+
+def make_tensor(arr, requires_grad=True):
+    """Build a Tensor, tolerating constructors with or without requires_grad."""
+    arr = np.asarray(arr, dtype=float)
+    try:
+        return Tensor(arr, requires_grad=requires_grad)
+    except TypeError:
+        return Tensor(arr)
+
+
+def scalar_out(t):
+    """Reduce a Tensor's output to a python float (sum) for finite-diff probing."""
+    return float(np.sum(as_array(t)))
+
+
+def central_diff(f, x, eps=EPS):
+    """Central-difference gradient of scalar-valued f at numpy point x."""
+    x = np.asarray(x, dtype=float)
+    grad = np.zeros_like(x)
+    it = np.nditer(x, flags=["multi_index"])
+    while not it.finished:
+        idx = it.multi_index
+        orig = x[idx]
+        x[idx] = orig + eps
+        fp = f(x)
+        x[idx] = orig - eps
+        fm = f(x)
+        x[idx] = orig
+        grad[idx] = (fp - fm) / (2 * eps)
+        it.iternext()
+    return grad
+
+
+def skip_if_unimplemented(fn, *args, **kwargs):
+    """Call fn; skip the test if it (or a dependency) is still a skeleton."""
     try:
         return fn(*args, **kwargs)
-    except NotImplementedError as e:
-        pytest.skip(f"depends on unimplemented piece: {e}")
+    except NotImplementedError as exc:  # pragma: no cover
+        pytest.skip(f"depends on unimplemented code: {exc}")
 
 
-def _T(data):
-    """Build a Tensor, skipping the test while the engine is unimplemented."""
-    return _requires(Tensor, data)
+# ============================================================================
+# Initializer shapes
+# ============================================================================
+@pytest.mark.parametrize(
+    "fn", [xavier_uniform, xavier_normal, he_normal, he_uniform]
+)
+def test_init_shape(fn):
+    W = skip_if_unimplemented(fn, 7, 5, seed=0)
+    W = np.asarray(W)
+    assert W.shape == (7, 5), f"{fn.__name__} must return shape (n_in, n_out)"
+    assert W.dtype == np.float64, f"{fn.__name__} must return float64"
 
 
-# --------------------------------------------------------------------------- #
-# toy-dataset fixtures: the data the loop is trained on
-# --------------------------------------------------------------------------- #
-def make_moons(n=200, noise=0.1, seed=None):
-    """Two interleaving half-moons: a 2-class problem no linear model solves.
-
-    Returns ``(X, y)`` as Tensors: ``X`` of shape ``(n, 2)``, ``y`` of shape
-    ``(n, 1)`` with labels in ``{-1.0, +1.0}``.  ``y`` is a column on purpose:
-    it matches the model's ``(n, 1)`` output so ``pred - y`` never broadcasts
-    to ``(n, n)``.  Deterministic given ``seed``; ``noise`` is the per-point
-    Gaussian jitter.
-    """
-    rng = np.random.default_rng(seed)
-    n_out = n // 2          # outer (upper) moon, label +1
-    n_in = n - n_out        # inner (lower) moon, label -1
-
-    # Outer moon: upper half-circle centered at the origin.
-    t_out = np.linspace(0.0, np.pi, n_out)
-    x_out = np.stack([np.cos(t_out), np.sin(t_out)], axis=1)
-
-    # Inner moon: lower half-circle, shifted right and down so the two interlock.
-    t_in = np.linspace(0.0, np.pi, n_in)
-    x_in = np.stack([1.0 - np.cos(t_in), 0.5 - np.sin(t_in)], axis=1)
-
-    X = np.concatenate([x_out, x_in], axis=0).astype(np.float64)
-    y = np.concatenate([np.ones(n_out), -np.ones(n_in)]).astype(np.float64)
-
-    X += rng.normal(0.0, noise, size=X.shape)
-    return Tensor(X), Tensor(y.reshape(-1, 1))
+# ============================================================================
+# Reproducibility with a fixed seed
+# ============================================================================
+@pytest.mark.parametrize(
+    "fn", [xavier_uniform, xavier_normal, he_normal, he_uniform]
+)
+def test_init_reproducible(fn):
+    a = skip_if_unimplemented(fn, 16, 12, seed=42)
+    b = skip_if_unimplemented(fn, 16, 12, seed=42)
+    assert np.allclose(a, b), f"{fn.__name__}: same seed must give same weights"
+    c = skip_if_unimplemented(fn, 16, 12, seed=43)
+    assert not np.allclose(a, c), f"{fn.__name__}: different seed must differ"
 
 
-def make_spiral(n_per_class=100, n_classes=2, noise=0.2, seed=None):
-    """Interleaved spiral arms: a harder non-linearly-separable 2-class problem.
-
-    Returns ``(X, y)`` as Tensors: ``X`` of shape ``(n_per_class * n_classes, 2)``,
-    ``y`` of shape ``(n_per_class * n_classes, 1)`` in ``{-1.0, +1.0}`` (even
-    arms +1, odd arms -1).  Deterministic given ``seed``; ``noise`` jitters the
-    angle of each point.
-    """
-    rng = np.random.default_rng(seed)
-    X = np.zeros((n_per_class * n_classes, 2), dtype=np.float64)
-    y = np.zeros(n_per_class * n_classes, dtype=np.float64)
-
-    for c in range(n_classes):
-        idx = slice(c * n_per_class, (c + 1) * n_per_class)
-        r = np.linspace(0.0, 1.0, n_per_class)                       # radius 0 -> 1
-        # Each arm starts a full turn offset from the last; noise jitters the angle.
-        theta = (
-            np.linspace(c * 4.0, (c + 1) * 4.0, n_per_class)
-            + rng.normal(0.0, noise, size=n_per_class)
-        )
-        X[idx] = np.stack([r * np.sin(theta), r * np.cos(theta)], axis=1)
-        y[idx] = 1.0 if c % 2 == 0 else -1.0
-
-    return Tensor(X), Tensor(y.reshape(-1, 1))
-
-
-# --------------------------------------------------------------------------- #
-# dataset fixtures: sanity of the contract the loop is built against
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("maker,kwargs,n_expected", [
-    (make_moons, dict(n=200, noise=0.1, seed=0), 200),
-    (make_moons, dict(n=201, noise=0.1, seed=0), 201),          # odd n splits fine
-    (make_spiral, dict(n_per_class=80, n_classes=2, noise=0.1, seed=1), 160),
-])
-def test_datasets_types_shapes_labels(maker, kwargs, n_expected):
-    X, y = _requires(maker, **kwargs)
-    assert isinstance(X, Tensor) and isinstance(y, Tensor)
-    assert X.shape == (n_expected, 2)
-    assert y.shape == (n_expected, 1), "y must be a (N, 1) column, not (N,)"
-    assert X.data.dtype == np.float64
-    labels = set(np.unique(y.data))
-    assert labels == {-1.0, 1.0}, f"labels must be exactly {{-1, +1}}, got {labels}"
-
-
-@pytest.mark.parametrize("maker,kwargs", [
-    (make_moons, dict(n=120, noise=0.1)),
-    (make_spiral, dict(n_per_class=60, noise=0.1)),
-])
-def test_datasets_deterministic_given_seed(maker, kwargs):
-    Xa, ya = _requires(maker, seed=7, **kwargs)
-    Xb, yb = _requires(maker, seed=7, **kwargs)
-    assert np.array_equal(Xa.data, Xb.data)
-    assert np.array_equal(ya.data, yb.data)
-    Xc, _ = _requires(maker, seed=8, **kwargs)
-    assert not np.allclose(Xa.data, Xc.data), "different seed must move the points"
-
-
-def test_make_moons_noise_jitters_points():
-    Xa, _ = _requires(make_moons, n=120, noise=0.0, seed=3)
-    Xb, _ = _requires(make_moons, n=120, noise=0.3, seed=3)
-    assert not np.allclose(Xa.data, Xb.data)
-
-
-# --------------------------------------------------------------------------- #
-# accuracy: off-graph sign agreement
-# --------------------------------------------------------------------------- #
-def test_accuracy_perfect_and_half():
-    pred = _T([[2.0], [-3.0], [0.7], [-0.1]])
-    y = _T([[1.0], [-1.0], [1.0], [-1.0]])
-    acc = _requires(accuracy, pred, y)
-    assert isinstance(acc, float)
-    assert np.isclose(acc, 1.0)
-    y_half = _T([[-1.0], [1.0], [1.0], [-1.0]])   # first two flipped
-    assert np.isclose(_requires(accuracy, pred, y_half), 0.5)
-
-
-def test_accuracy_mixed_types_and_shapes():
-    """Tensor or ndarray, (N, 1) or (N,) -- all four combinations agree."""
-    p_col = _T([[1.0], [-2.0], [3.0], [-4.0]])
-    y_flat = np.array([1.0, -1.0, -1.0, -1.0])
-    expected = 0.75
-    assert np.isclose(_requires(accuracy, p_col, y_flat), expected)
-    assert np.isclose(_requires(accuracy, p_col.data, y_flat), expected)
-    assert np.isclose(_requires(accuracy, p_col, _T(y_flat)), expected)
-    assert np.isclose(
-        _requires(accuracy, p_col.data.reshape(-1), _T(y_flat.reshape(-1, 1))),
-        expected,
+# ============================================================================
+# Empirical variance matches the derived target Var(W)
+# ============================================================================
+def test_xavier_variance_target():
+    n_in, n_out = 200, 300
+    target = 2.0 / (n_in + n_out)  # Var(W) for Xavier
+    Wu = skip_if_unimplemented(xavier_uniform, n_in, n_out, seed=0)
+    Wn = skip_if_unimplemented(xavier_normal, n_in, n_out, seed=0)
+    vu, vn = np.var(Wu), np.var(Wn)
+    assert np.isclose(vu, target, rtol=0.10), (
+        f"xavier_uniform var {vu:.3e} should match 2/(n_in+n_out)={target:.3e}"
+    )
+    assert np.isclose(vn, target, rtol=0.10), (
+        f"xavier_normal var {vn:.3e} should match 2/(n_in+n_out)={target:.3e}"
     )
 
 
-def test_accuracy_zero_prediction_counts_wrong():
-    pred = _T([[0.0], [1.0]])
-    y = _T([[1.0], [1.0]])
-    assert np.isclose(_requires(accuracy, pred, y), 0.5)
+def test_he_variance_target():
+    n_in, n_out = 256, 128
+    target = 2.0 / n_in  # Var(W) for He/Kaiming
+    Wn = skip_if_unimplemented(he_normal, n_in, n_out, seed=0)
+    Wu = skip_if_unimplemented(he_uniform, n_in, n_out, seed=0)
+    vn, vu = np.var(Wn), np.var(Wu)
+    assert np.isclose(vn, target, rtol=0.10), (
+        f"he_normal var {vn:.3e} should match 2/n_in={target:.3e}"
+    )
+    assert np.isclose(vu, target, rtol=0.10), (
+        f"he_uniform var {vu:.3e} should match 2/n_in={target:.3e}"
+    )
 
 
-def test_accuracy_size_mismatch_raises():
-    pred = _T([[1.0], [2.0], [3.0]])
-    y = _T([[1.0], [-1.0]])
+def test_xavier_gain_scales_variance():
+    n_in, n_out = 128, 128
+    base = skip_if_unimplemented(xavier_normal, n_in, n_out, gain=1.0, seed=1)
+    scaled = skip_if_unimplemented(xavier_normal, n_in, n_out, gain=2.0, seed=1)
+    # Variance scales with gain**2 -> std scales with gain.
+    assert np.isclose(np.std(scaled) / np.std(base), 2.0, rtol=0.10), (
+        "gain=2 should double the std of xavier_normal"
+    )
+
+
+def test_init_zero_mean():
+    W = skip_if_unimplemented(he_normal, 256, 256, seed=2)
+    assert abs(np.mean(W)) < 0.02, "He init should be (approximately) zero-mean"
+
+
+# ============================================================================
+# init_dense overwrites params in place but keeps the leaf Tensors
+# ============================================================================
+def test_init_dense_in_place():
+    layer = skip_if_unimplemented(Dense, 4, 3, bias=True, seed=0)
+    W_old = layer.W  # same object must survive
+    b_old = layer.b
+    newW = skip_if_unimplemented(he_normal, 4, 3, seed=7)
+    skip_if_unimplemented(init_dense, layer, newW, b=np.zeros(3))
+    assert layer.W is W_old, "init_dense must keep the SAME W Tensor object"
+    assert layer.b is b_old, "init_dense must keep the SAME b Tensor object"
+    assert np.allclose(as_array(layer.W), newW), "W.data must be overwritten"
+    assert np.allclose(as_array(layer.b), 0.0), "b.data must be overwritten to 0"
+    assert as_array(layer.W.grad).shape == newW.shape, "grad reset to W shape"
+
+
+def test_init_dense_shape_mismatch_raises():
+    layer = skip_if_unimplemented(Dense, 4, 3, bias=True, seed=0)
     with pytest.raises(ValueError):
-        _requires(accuracy, pred, y)
+        skip_if_unimplemented(init_dense, layer, np.zeros((4, 5)))
 
 
-def test_accuracy_is_off_graph():
-    """A metric must not touch grads or extend the graph."""
-    pred = _T([[2.0], [-1.0]])
-    y = _T([[1.0], [-1.0]])
-    _requires(accuracy, pred, y)
-    assert np.allclose(pred.grad, 0.0), "accuracy must not write grads"
-    assert np.allclose(y.grad, 0.0), "accuracy must not write grads"
-
-
-# --------------------------------------------------------------------------- #
-# train: the canonical loop, pinned against a hand-rolled reference
-# --------------------------------------------------------------------------- #
-def test_train_returns_history_dict():
-    X, y = _requires(make_moons, n=160, noise=0.1, seed=0)
-    model = _requires(MLP, [2, 16, 1], activation="tanh", seed=0)
-    history = _requires(train, model, X, y, lr=0.1, epochs=50)
-    assert set(history.keys()) == {"loss", "accuracy"}
-    assert len(history["loss"]) == 50
-    assert len(history["accuracy"]) == 50
-    assert all(isinstance(v, float) and np.isfinite(v) for v in history["loss"])
-    assert all(
-        isinstance(v, float) and 0.0 <= v <= 1.0 for v in history["accuracy"]
+# ============================================================================
+# Activation-statistics harness: success and failure modes
+# ============================================================================
+def _stats(init_fn, activation, sizes=None, **kw):
+    if sizes is None:
+        sizes = [64] * 8
+    return skip_if_unimplemented(
+        forward_activation_stats, sizes, init_fn, activation,
+        n_samples=512, seed=0, **kw,
     )
 
 
-def test_train_matches_manual_loop_exactly():
-    """train() for 5 epochs == a hand-rolled forward/loss/backward/step/zero
-    loop on an identically-seeded model.  This equality catches a shuffled
-    step order and any stray extra update (a missing zero_grad is caught by
-    test_train_leaves_grads_zeroed below)."""
-    X, y = _requires(make_moons, n=64, noise=0.1, seed=2)
+def test_stats_length_and_keys():
+    sizes = [32, 32, 32, 32]
+    stats = _stats(lambda i, o: xavier_normal(i, o, seed=0), "tanh", sizes=sizes)
+    assert len(stats) == len(sizes) - 1, "one stats dict per layer"
+    for d in stats:
+        for k in ("mean", "std", "saturated", "dead"):
+            assert k in d, f"each stats dict must contain key {k!r}"
 
-    model_a = _requires(MLP, [2, 8, 1], activation="tanh", seed=3)
-    history = _requires(train, model_a, X, y, lr=0.1, epochs=5)
 
-    model_b = _requires(MLP, [2, 8, 1], activation="tanh", seed=3)
-    opt = _requires(SGD, model_b.parameters(), lr=0.1)
-    manual_losses = []
-    for _ in range(5):
-        pred = model_b(X)
-        loss = mse_loss(pred, y)
-        loss.backward()
-        opt.step()
-        opt.zero_grad()
-        manual_losses.append(float(loss.data))
-
-    assert np.allclose(history["loss"], manual_losses, rtol=0, atol=0), (
-        "train() must be the canonical loop exactly:\n"
-        f" train ={history['loss']}\n manual={manual_losses}"
+def test_xavier_tanh_keeps_std_stable():
+    stats = _stats(lambda i, o: xavier_normal(i, o, seed=0), "tanh")
+    first, last = stats[0]["std"], stats[-1]["std"]
+    # Matched init: std should not collapse and not explode across depth.
+    assert last > 0.2 * first, (
+        f"Xavier+tanh std collapsed across depth: first={first:.3f} last={last:.3f}"
     )
-    for p_a, p_b in zip(model_a.parameters(), model_b.parameters()):
-        assert np.array_equal(p_a.data, p_b.data), (
-            "parameters after train() differ from the manual loop "
-            "(zero_grad missing or step order wrong?)"
-        )
-
-
-def test_train_loss_decreases():
-    X, y = _requires(make_moons, n=160, noise=0.1, seed=0)
-    model = _requires(MLP, [2, 16, 1], activation="tanh", seed=0)
-    history = _requires(train, model, X, y, lr=0.1, epochs=50)
-    losses = history["loss"]
-    assert losses[-1] < losses[0]
-    assert losses[-1] < 0.9 * losses[0], "loss should drop meaningfully, not crawl"
-
-
-def test_train_uses_provided_optimizer_and_ignores_lr():
-    X, y = _requires(make_moons, n=120, noise=0.1, seed=0)
-    model = _requires(MLP, [2, 8, 1], activation="tanh", seed=0)
-    opt = _requires(SGD, model.parameters(), lr=0.05)
-    # lr=1e6 would explode instantly if train built its own optimizer from it.
-    history = _requires(train, model, X, y, lr=1e6, epochs=20, optimizer=opt)
-    assert len(history["loss"]) == 20
-    assert all(np.isfinite(v) for v in history["loss"])
-    assert history["loss"][-1] <= history["loss"][0]
-
-
-def test_train_leaves_grads_zeroed():
-    """The loop ends on zero_grad, so the caller can backward() fresh."""
-    X, y = _requires(make_moons, n=40, noise=0.1, seed=0)
-    model = _requires(MLP, [2, 4, 1], activation="tanh", seed=0)
-    _requires(train, model, X, y, lr=0.1, epochs=3)
-    for p in model.parameters():
-        assert np.allclose(p.grad, 0.0)
-        assert p.grad.shape == p.data.shape
-
-
-def test_train_accepts_flat_y_identically():
-    """y as (N,) must train exactly like the same y as (N, 1)."""
-    X, y = _requires(make_moons, n=60, noise=0.1, seed=1)
-    y_flat = Tensor(y.data.reshape(-1))
-
-    model_col = _requires(MLP, [2, 8, 1], activation="tanh", seed=4)
-    hist_col = _requires(train, model_col, X, y, lr=0.1, epochs=5)
-    model_flat = _requires(MLP, [2, 8, 1], activation="tanh", seed=4)
-    hist_flat = _requires(train, model_flat, X, y_flat, lr=0.1, epochs=5)
-
-    assert np.allclose(hist_col["loss"], hist_flat["loss"], rtol=0, atol=0), (
-        "(N,) y must be normalized to (N, 1) -- did pred - y broadcast to (N, N)?"
+    assert stats[-1]["saturated"] < 0.5, (
+        "Xavier+tanh should not saturate most units"
     )
 
 
-def test_train_rejects_non_tensor_inputs():
-    X, y = _requires(make_moons, n=40, noise=0.1, seed=0)
-    model = _requires(MLP, [2, 8, 1], activation="tanh", seed=0)
-    with pytest.raises(Exception):
-        _requires(train, model, X.data, y, epochs=1)         # X is ndarray
-    with pytest.raises(Exception):
-        _requires(train, model, X, y.data, epochs=1)         # y is ndarray
-    with pytest.raises(Exception):
-        _requires(train, model, X.data, y.data, epochs=1)    # both
-
-
-def test_train_rejects_bad_shapes():
-    X, y = _requires(make_moons, n=40, noise=0.1, seed=0)
-    model = _requires(MLP, [2, 8, 1], activation="tanh", seed=0)
-    with pytest.raises(ValueError):
-        _requires(train, model, X, Tensor(np.ones((39, 1))), epochs=1)  # N mismatch
-    with pytest.raises(ValueError):
-        _requires(train, model, X, Tensor(np.ones((40, 2))), epochs=1)  # y not a column
-    with pytest.raises(ValueError):
-        _requires(train, model, Tensor(np.ones(40)), y, epochs=1)       # X not 2-D
-
-
-# --------------------------------------------------------------------------- #
-# end-to-end: the loop actually learns
-# --------------------------------------------------------------------------- #
-def test_train_fits_noiseless_moons():
-    X, y = _requires(make_moons, n=200, noise=0.0, seed=0)
-    model = _requires(MLP, [2, 16, 1], activation="tanh", seed=0)
-    history = _requires(train, model, X, y, lr=0.2, epochs=400)
-    final_acc = _requires(accuracy, model(X), y)
-    assert final_acc >= 0.90, (
-        f"expected >= 90% train accuracy on clean moons, got {final_acc:.3f}"
+def test_he_relu_keeps_signal_alive():
+    stats = _stats(lambda i, o: he_normal(i, o, seed=0), "relu")
+    first, last = stats[0]["std"], stats[-1]["std"]
+    assert last > 0.2 * first, (
+        f"He+relu std collapsed across depth: first={first:.3f} last={last:.3f}"
     )
-    # the recorded history must agree with a fresh evaluation of the metric.
-    assert np.isclose(history["accuracy"][-1], final_acc, atol=0.05)
 
 
-# --------------------------------------------------------------------------- #
-# plot helper (provided): smoke test, skipped when matplotlib is absent
-# --------------------------------------------------------------------------- #
-def test_plot_history_saves_figure(tmp_path):
-    matplotlib = pytest.importorskip("matplotlib")
-    matplotlib.use("Agg")
-    history = {"loss": [1.0, 0.5, 0.25], "accuracy": [0.5, 0.75, 1.0]}
-    out = tmp_path / "history.png"
-    fig = plot_history(history, path=str(out))
-    assert out.exists() and out.stat().st_size > 0
-    assert fig is not None
+def test_tiny_init_vanishes():
+    # Deliberately tiny weights: per-layer factor n_in*Var(W) << 1 -> std -> 0.
+    tiny = lambda i, o: np.random.default_rng(0).normal(0.0, 0.01, size=(i, o))
+    stats = _stats(tiny, "tanh")
+    assert stats[-1]["std"] < 0.1 * stats[0]["std"], (
+        "tiny init should make activation std vanish with depth"
+    )
+
+
+def test_large_tanh_saturates():
+    # Deliberately large weights push tanh into its flat tails.
+    big = lambda i, o: np.random.default_rng(0).normal(0.0, 1.0, size=(i, o))
+    stats = _stats(big, "tanh")
+    assert stats[-1]["saturated"] > 0.5, (
+        "large init should saturate most tanh units (|out| > 0.98)"
+    )
+
+
+def test_large_relu_kills_units():
+    big = lambda i, o: np.random.default_rng(0).normal(0.0, 1.0, size=(i, o))
+    stats = _stats(big, "relu")
+    # With large symmetric weights ~ half of pre-activations are negative -> dead.
+    assert stats[-1]["dead"] > 0.3, (
+        "large init should leave a substantial dead-ReLU fraction"
+    )
+
+
+# ============================================================================
+# A freshly initialized Dense still gradchecks (init != gradient)
+# ============================================================================
+def _make_inited_dense(init_fn, n_in, n_out, seed):
+    layer = Dense(n_in, n_out, bias=True, seed=seed)
+    init_dense(layer, init_fn(n_in, n_out, seed=seed), b=np.zeros(n_out))
+    return layer
+
+
+def test_gradcheck_wrt_W_after_init():
+    layer = skip_if_unimplemented(_make_inited_dense, he_normal, 4, 3, 0)
+    X = np.array([[0.7, -1.3, 0.2, 2.1], [1.0, 0.5, -0.5, 0.3]])
+
+    layer.zero_grad()
+    y = skip_if_unimplemented(layer, make_tensor(X, requires_grad=False))
+    y.backward()
+    g_analytic = as_array(layer.W.grad)
+
+    W0 = as_array(layer.W).copy()
+
+    def f(W):
+        layer.W.data = W.copy()
+        return scalar_out(layer(make_tensor(X, requires_grad=False)))
+
+    g_num = central_diff(f, W0)
+    layer.W.data = W0
+    assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
+        f"dL/dW mismatch after init:\n analytic={g_analytic}\n numeric ={g_num}"
+    )
+
+
+def test_gradcheck_wrt_b_after_init():
+    layer = skip_if_unimplemented(_make_inited_dense, xavier_normal, 3, 4, 1)
+    X = np.array([[0.4, -0.9, 1.7], [0.2, 0.1, -0.3], [1.1, -1.0, 0.5]])
+
+    layer.zero_grad()
+    y = skip_if_unimplemented(layer, make_tensor(X, requires_grad=False))
+    y.backward()
+    g_analytic = as_array(layer.b.grad).reshape(-1)
+
+    b0 = as_array(layer.b).reshape(-1).copy()
+
+    def f(b):
+        layer.b.data = b.copy().reshape(np.asarray(layer.b.data).shape)
+        return scalar_out(layer(make_tensor(X, requires_grad=False)))
+
+    g_num = central_diff(f, b0)
+    layer.b.data = b0.reshape(np.asarray(layer.b.data).shape)
+    assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
+        f"dL/db mismatch after init: analytic={g_analytic}, numeric={g_num}"
+    )
+
+
+def test_gradcheck_wrt_X_after_init():
+    layer = skip_if_unimplemented(_make_inited_dense, he_normal, 4, 2, 2)
+    X0 = np.array([[0.3, -0.6, 1.2, -2.0]])
+
+    layer.zero_grad()
+    x = make_tensor(X0, requires_grad=True)
+    y = skip_if_unimplemented(layer, x)
+    y.backward()
+    g_analytic = as_array(x.grad)
+
+    def f(xv):
+        return scalar_out(layer(make_tensor(xv, requires_grad=False)))
+
+    g_num = central_diff(f, X0.copy())
+    assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
+        f"dL/dX mismatch after init:\n analytic={g_analytic}\n numeric ={g_num}"
+    )
