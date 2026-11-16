@@ -8,7 +8,16 @@ from src.tensor import Tensor
 from src.nn import Neuron, Dense, MLP
 from src.loss import mse_loss, mae_loss, log_softmax, softmax, cross_entropy_loss
 from src.optim import Optimizer, SGD, SGDMomentum, Adam, AdamW, RMSProp
-from src.trainer import accuracy, train, plot_history
+from src.trainer import (
+    accuracy, 
+    train, 
+    plot_history, 
+    iterate_minibatches, 
+    train_minibatch, 
+    gradient_noise, 
+    epochs_to_threshold,
+    plot_batch_comparison
+)
 from src.init import (
     xavier_uniform,
     xavier_normal,
@@ -22,36 +31,14 @@ EPS = 1e-6
 ATOL = 1e-6
 RTOL = 1e-4
 
-Momentum = SGDMomentum
-
-# --- A minimal parameter object matching the Tensor .data/.grad contract -----
-class Param:
-    """Tiny stand-in for a leaf ``Tensor``: ``.data``/``.grad`` plus the two
-    hooks the stage_14 ``Optimizer`` contract touches (``shape``, ``zero_grad``)."""
-
-    def __init__(self, data):
-        self.data = np.asarray(data, dtype=float)
-        self.grad = np.zeros_like(self.data)
-
-    @property
-    def shape(self):
-        return self.data.shape
-
-    def zero_grad(self):
-        self.grad = np.zeros_like(self.data)
-
-
-def make_params(arrays):
-    return [Param(a) for a in arrays]
-
-
-def quadratic_loss(thetas):
-    """L = 0.5 * sum(theta**2) over a list of arrays; grad is theta itself."""
-    return 0.5 * sum(float(np.sum(t ** 2)) for t in thetas)
+# --- Small helpers -----------------------------------------------------------
+def as_array(t):
+    """Return the underlying numpy array of a Tensor (or pass arrays through)."""
+    return np.asarray(t.data if hasattr(t, "data") else t, dtype=float)
 
 
 def central_diff(f, x, eps=EPS):
-    """Numerical gradient of scalar f at numpy point x (any shape)."""
+    """Numerical gradient of scalar-valued f at numpy point x (any shape)."""
     x = np.asarray(x, dtype=float)
     grad = np.zeros_like(x)
     it = np.nditer(x, flags=["multi_index"])
@@ -68,300 +55,216 @@ def central_diff(f, x, eps=EPS):
     return grad
 
 
-def set_grad_quadratic(params):
-    """Set p.grad = p.data for every param (gradient of 0.5*sum(theta**2))."""
-    for p in params:
-        p.grad = p.data.copy()
+def toy_data(n=40, seed=0, noise=0.1):
+    """A small reproducible moons dataset (local fixture): X (n, 2), y (n,) in {-1, +1}."""
+    rng = np.random.default_rng(seed)
+    n_out = n // 2
+    n_in = n - n_out
+    t_out = np.linspace(0.0, np.pi, n_out)
+    x_out = np.stack([np.cos(t_out), np.sin(t_out)], axis=1)
+    t_in = np.linspace(0.0, np.pi, n_in)
+    x_in = np.stack([1.0 - np.cos(t_in), 0.5 - np.sin(t_in)], axis=1)
+    X = np.concatenate([x_out, x_in], axis=0).astype(np.float64)
+    y = np.concatenate([np.ones(n_out), -np.ones(n_in)]).astype(np.float64)
+    X += rng.normal(0.0, noise, size=X.shape)
+    return Tensor(X), Tensor(y)
 
 
 # ===========================================================================
-# Gradcheck: the gradient we feed the optimizer is the true gradient
+# iterate_minibatches: exact partitioning
 # ===========================================================================
-def test_quadratic_gradcheck():
-    """g = theta is the analytic gradient of 0.5*sum(theta**2); verify numerically."""
-    theta = np.array([0.7, -1.3, 0.2, 2.1])
-    g_analytic = theta.copy()  # what we feed the optimizer
+def test_batches_cover_every_row_once_no_shuffle():
+    X = np.arange(20, dtype=float).reshape(10, 2)
+    y = np.arange(10, dtype=float)
+    batches = list(iterate_minibatches(X, y, batch_size=3, shuffle=False))
+    # ceil(10 / 3) == 4 batches; sizes 3,3,3,1
+    assert [b[0].shape[0] for b in batches] == [3, 3, 3, 1], "wrong batch sizes"
+    Xcat = np.concatenate([b[0] for b in batches], axis=0)
+    ycat = np.concatenate([b[1] for b in batches], axis=0)
+    assert np.array_equal(Xcat, X), "no-shuffle batches must recover X in order"
+    assert np.array_equal(ycat, y), "no-shuffle batches must recover y in order"
 
-    def f(x):
-        return 0.5 * float(np.sum(x ** 2))
 
-    g_num = central_diff(f, theta.copy())
-    assert np.allclose(g_analytic, g_num, atol=1e-6, rtol=1e-5), (
-        f"quadratic gradient mismatch:\n analytic={g_analytic}\n numeric ={g_num}"
+def test_drop_last_drops_partial_batch():
+    X = np.arange(20, dtype=float).reshape(10, 2)
+    y = np.arange(10, dtype=float)
+    batches = list(
+        iterate_minibatches(X, y, batch_size=3, shuffle=False, drop_last=True)
+    )
+    assert len(batches) == 10 // 3, "drop_last must yield N // B batches"
+    assert all(b[0].shape[0] == 3 for b in batches), "kept batches are full-size"
+
+
+def test_shuffle_is_a_permutation_and_aligned():
+    X = np.arange(24, dtype=float).reshape(12, 2)
+    y = X[:, 0].copy()  # y[i] == X[i, 0] so we can check alignment after shuffle
+    batches = list(iterate_minibatches(X, y, batch_size=5, shuffle=True, seed=1))
+    Xcat = np.concatenate([b[0] for b in batches], axis=0)
+    ycat = np.concatenate([b[1] for b in batches], axis=0)
+    # All 12 rows present exactly once (as a set of first coords).
+    assert sorted(Xcat[:, 0].tolist()) == sorted(X[:, 0].tolist()), (
+        "shuffled batches must be a permutation covering every row once"
+    )
+    # X_b and y_b stayed paired through the shuffle.
+    assert np.array_equal(ycat, Xcat[:, 0]), "shuffle must keep X_b and y_b aligned"
+
+
+def test_shuffle_seed_is_reproducible_and_varies():
+    X = np.arange(40, dtype=float).reshape(20, 2)
+    y = np.arange(20, dtype=float)
+    a = np.concatenate(
+        [b[1] for b in iterate_minibatches(X, y, 4, shuffle=True, seed=7)]
+    )
+    b = np.concatenate(
+        [b[1] for b in iterate_minibatches(X, y, 4, shuffle=True, seed=7)]
+    )
+    c = np.concatenate(
+        [b[1] for b in iterate_minibatches(X, y, 4, shuffle=True, seed=8)]
+    )
+    assert np.array_equal(a, b), "same seed must give the same order"
+    assert not np.array_equal(a, c), "different seed should (almost surely) differ"
+
+
+def test_bad_batch_size_raises():
+    X = np.zeros((5, 2))
+    y = np.zeros(5)
+    for bad in (0, -1, 6):
+        with pytest.raises(AssertionError):
+            list(iterate_minibatches(X, y, batch_size=bad))
+
+
+def test_mismatched_lengths_raise():
+    with pytest.raises(AssertionError):
+        list(iterate_minibatches(np.zeros((5, 2)), np.zeros(4), batch_size=2))
+
+
+# ===========================================================================
+# train_minibatch: step counts, history, and full-batch equivalence
+# ===========================================================================
+def test_step_count_matches_batches_per_epoch():
+    X, y = toy_data(n=40, seed=0)
+    model = MLP([2, 8, 1], activation="tanh", seed=0)
+    epochs, B = 3, 16
+    out = train_minibatch(
+        model, X, y, lr=0.05, epochs=epochs, batch_size=B, shuffle=True, seed=0
+    )
+    n_batches = int(np.ceil(X.shape[0] / B))
+    assert out["steps"] == epochs * n_batches, "steps == epochs * ceil(N/B)"
+    assert len(out["batch_loss"]) == out["steps"], "one batch_loss per step"
+    assert len(out["epoch_loss"]) == epochs, "one epoch_loss per epoch"
+
+
+def test_epoch_loss_decreases():
+    X, y = toy_data(n=60, seed=1)
+    model = MLP([2, 16, 1], activation="tanh", seed=1)
+    out = train_minibatch(
+        model, X, y, lr=0.1, epochs=80, batch_size=16, shuffle=True, seed=1
+    )
+    hist = out["epoch_loss"]
+    assert hist[-1] < hist[0], "epoch loss must fall over training"
+    assert hist[-1] < 0.6 * hist[0], "loss should drop meaningfully, not crawl"
+
+
+def test_full_batch_matches_manual_loop():
+    """batch_size == N with shuffle=False must equal a hand-rolled full-batch
+    loop on the SAME initial model -- i.e. mini-batch reduces to stage_15."""
+    X, y = toy_data(n=24, seed=2)
+
+    # Model A: trained via train_minibatch in full-batch mode.
+    model_a = MLP([2, 8, 1], activation="tanh", seed=3)
+    out = train_minibatch(
+        model_a, X, y, lr=0.1, epochs=10, batch_size=X.shape[0], shuffle=False
     )
 
-
-# ===========================================================================
-# Base API
-# ===========================================================================
-def test_zero_grad_clears():
-    params = make_params([np.array([1.0, 2.0]), np.array([[3.0]])])
-    for p in params:
-        p.grad = np.ones_like(p.data) * 5.0
-    opt = SGD(params, lr=0.1)
-    opt.zero_grad()
-    for p in params:
-        assert np.allclose(p.grad, 0.0), "zero_grad must clear every p.grad"
-        assert p.grad.shape == p.data.shape, "grad shape must match data shape"
-
-
-def test_base_step_not_implemented():
-    params = make_params([np.array([1.0])])
-    base = Optimizer(params)
-    with pytest.raises(NotImplementedError):
-        base.step()
-
-
-def test_step_leaves_grad_untouched():
-    params = make_params([np.array([1.0, -2.0, 3.0])])
-    set_grad_quadratic(params)
-    saved = params[0].grad.copy()
-    Adam(params, lr=1e-3).step()
-    assert np.allclose(params[0].grad, saved), "step() must not modify p.grad"
-
-
-# ===========================================================================
-# SGD / Momentum (imported from stage_14 / stage_17, used here unchanged)
-# ===========================================================================
-def test_sgd_plain_step():
-    """stage_14 SGD is exactly p.data -= lr * p.grad."""
-    lr = 0.05
-    data = np.array([1.0, -2.0, 3.0])
-    grad = np.array([0.5, 0.5, -1.0])
-    p = Param(data.copy())
-    p.grad = grad.copy()
-    SGD([p], lr=lr).step()
-    assert np.allclose(p.data, data - lr * grad), (
-        "plain SGD must be exactly p.data -= lr*p.grad"
-    )
-
-
-def test_momentum_accumulates():
-    """stage_17 Momentum: velocity grows as g, g(1+b), g(1+b+b^2), ..."""
-    lr, b = 0.1, 0.9
-    g = np.array([1.0, -2.0])
-    p = Param(np.zeros(2))
-    opt = Momentum([p], lr=lr, beta=b)
-
-    v = np.zeros(2)
-    theta = p.data.copy()
-    for _ in range(5):
-        p.grad = g.copy()
+    # Model B: identical init, manual full-batch loop using the stage_15 stack.
+    model_b = MLP([2, 8, 1], activation="tanh", seed=3)
+    opt = SGD(model_b.parameters(), 0.1)
+    manual = []
+    yb = np.asarray(y.data, dtype=float).reshape(-1, 1)
+    for _ in range(10):
+        pred = model_b(X)
+        loss = mse_loss(pred, yb)
+        loss.backward()
         opt.step()
-        v = b * v + g
-        theta = theta - lr * v
-        assert np.allclose(p.data, theta, atol=ATOL), (
-            "Momentum velocity update mismatch"
-        )
+        opt.zero_grad()
+        manual.append(float(loss.data))
 
-
-# ===========================================================================
-# RMSProp
-# ===========================================================================
-def test_rmsprop_reference_update():
-    lr, beta, eps = 0.01, 0.99, 1e-8
-    data = np.array([1.0, -2.0, 0.5])
-    grad = np.array([0.3, -0.7, 2.0])
-    p = Param(data.copy())
-    p.grad = grad.copy()
-    RMSProp([p], lr=lr, beta=beta, eps=eps).step()
-
-    v = (1 - beta) * grad ** 2
-    expected = data - lr * grad / (np.sqrt(v) + eps)
-    assert np.allclose(p.data, expected, atol=ATOL), (
-        f"RMSProp update mismatch:\n got     ={p.data}\n expected={expected}"
+    assert np.allclose(out["epoch_loss"], manual, atol=ATOL, rtol=RTOL), (
+        "full-batch train_minibatch must match a manual full-batch loop:\n "
+        f"train_minibatch={out['epoch_loss']}\n manual         ={manual}"
     )
+    assert out["steps"] == 10, "full-batch => one step per epoch"
 
 
 # ===========================================================================
-# Adam
+# gradient_noise: Var[g_hat_B] ~ sigma**2 / B
 # ===========================================================================
-def test_adam_step_counter():
-    p = Param(np.array([1.0]))
-    opt = Adam([p], lr=1e-3)
-    assert opt.t == 0, "Adam.t must start at 0"
-    p.grad = np.array([1.0])
-    opt.step()
-    assert opt.t == 1, "first step() must make t == 1"
-    opt.step()
-    assert opt.t == 2, "t must increment each step"
-
-
-def test_adam_reference_first_step():
-    """One Adam step from m=v=0 against a hand-computed reference."""
-    lr = 1e-3
-    b1, b2, eps = 0.9, 0.999, 1e-8
-    data = np.array([1.0, -2.0, 3.0])
-    grad = np.array([0.5, -1.5, 0.25])
-    p = Param(data.copy())
-    p.grad = grad.copy()
-
-    Adam([p], lr=lr, betas=(b1, b2), eps=eps).step()
-
-    m = (1 - b1) * grad
-    v = (1 - b2) * grad ** 2
-    m_hat = m / (1 - b1 ** 1)
-    v_hat = v / (1 - b2 ** 1)
-    expected = data - lr * m_hat / (np.sqrt(v_hat) + eps)
-    assert np.allclose(p.data, expected, atol=ATOL), (
-        f"Adam first-step mismatch:\n got     ={p.data}\n expected={expected}"
+def test_gradient_noise_decreases_with_batch_size():
+    X, y = toy_data(n=128, seed=4)
+    model = MLP([2, 16, 1], activation="tanh", seed=5)
+    noise_small = gradient_noise(model, X, y, batch_size=8, n_batches=40, seed=0)
+    noise_large = gradient_noise(model, X, y, batch_size=64, n_batches=40, seed=0)
+    assert noise_small > noise_large, (
+        "gradient noise must shrink as batch size grows (sigma**2 / B):\n "
+        f"B=8 -> {noise_small}, B=64 -> {noise_large}"
     )
+    assert noise_large >= 0.0, "variance is non-negative"
 
 
-def test_adam_reference_two_steps():
-    """Two Adam steps with changing gradients; checks the EMA carry-over."""
-    lr, b1, b2, eps = 1e-2, 0.9, 0.999, 1e-8
-    data = np.array([0.5, -0.5])
-    g1 = np.array([1.0, -2.0])
-    g2 = np.array([0.5, 0.5])
-    p = Param(data.copy())
-    opt = Adam([p], lr=lr, betas=(b1, b2), eps=eps)
-
-    m = np.zeros(2)
-    v = np.zeros(2)
-    theta = data.copy()
-    for t, g in enumerate([g1, g2], start=1):
-        p.grad = g.copy()
-        opt.step()
-        m = b1 * m + (1 - b1) * g
-        v = b2 * v + (1 - b2) * g ** 2
-        m_hat = m / (1 - b1 ** t)
-        v_hat = v / (1 - b2 ** t)
-        theta = theta - lr * m_hat / (np.sqrt(v_hat) + eps)
-        assert np.allclose(p.data, theta, atol=ATOL), (
-            f"Adam multi-step mismatch at t={t}:\n got={p.data}\n exp={theta}"
-        )
+def test_gradient_noise_does_not_move_model():
+    X, y = toy_data(n=64, seed=6)
+    model = MLP([2, 8, 1], activation="tanh", seed=7)
+    before = [as_array(p).copy() for p in model.parameters()]
+    _ = gradient_noise(model, X, y, batch_size=16, n_batches=10, seed=0)
+    after = [as_array(p) for p in model.parameters()]
+    for b, a in zip(before, after):
+        assert np.allclose(b, a, atol=0.0), "gradient_noise must not update params"
 
 
-def test_adam_betas_zero_is_signed_step():
-    """betas=(0,0): m_hat=g, v_hat=g**2 -> update ~ -lr*sign(g) (eps tiny)."""
-    lr = 1e-2
-    grad = np.array([2.0, -5.0, 0.1])
-    p = Param(np.zeros(3))
-    p.grad = grad.copy()
-    Adam([p], lr=lr, betas=(0.0, 0.0), eps=1e-12).step()
-    expected = -lr * np.sign(grad)
-    assert np.allclose(p.data, expected, atol=1e-6), (
-        f"Adam betas=(0,0) must give a signed step:\n got={p.data}\n exp={expected}"
-    )
+# ===========================================================================
+# epochs_to_threshold
+# ===========================================================================
+def test_epochs_to_threshold_first_crossing():
+    hist = [1.0, 0.8, 0.5, 0.3, 0.25]
+    assert epochs_to_threshold(hist, 0.55) == 3, "1-based index of first <= thr"
+    assert epochs_to_threshold(hist, 1.0) == 1, "epoch 1 already meets threshold"
+    assert epochs_to_threshold(hist, 0.1) == -1, "never reached => -1"
 
 
-def test_adam_bias_correction_constant_grad():
-    """With a constant gradient g, the bias-corrected m_hat equals g exactly.
-
-    Unrolling m_t = (1-b1) sum b1^{t-i} g = g (1 - b1^t); dividing by (1-b1^t)
-    recovers g. We reconstruct m_hat from internal buffers if exposed; otherwise
-    we verify the resulting step has magnitude ~ lr (since m_hat/sqrt(v_hat) ~ 1).
-    """
-    lr, b1, b2, eps = 1e-3, 0.9, 0.999, 1e-8
-    g = np.array([3.0])
-    p = Param(np.array([0.0]))
-    opt = Adam([p], lr=lr, betas=(b1, b2), eps=eps)
-
-    prev = p.data.copy()
-    for t in range(1, 6):
-        p.grad = g.copy()
-        opt.step()
-        step_mag = abs(float((p.data - prev).item()))
-        prev = p.data.copy()
-        # For constant grad, m_hat -> g and v_hat -> g**2, so the step magnitude
-        # approaches lr * |g| / |g| = lr from the very first step.
-        assert abs(step_mag - lr) < 5e-4, (
-            f"bias-corrected Adam step at t={t} should be ~lr={lr}, got {step_mag}"
-        )
-
-
-def test_adam_converges_on_quadratic():
+# ===========================================================================
+# gradcheck: batched mse_loss backward vs central differences
+# ===========================================================================
+def test_batched_mse_backward_matches_central_diff():
+    """One batched forward/backward through the MLP must produce a .grad equal to
+    a central-difference gradient of the scalar batch loss w.r.t. a parameter."""
     rng = np.random.default_rng(0)
-    p = Param(rng.uniform(-3, 3, size=10))
-    opt = Adam([p], lr=0.1)
-    for _ in range(500):
-        set_grad_quadratic([p])
-        opt.step()
-    assert quadratic_loss([p.data]) < 1e-3, (
-        "Adam should drive the convex quadratic loss near zero"
+    X = rng.standard_normal((6, 2))            # a batch of B=6
+    yb = rng.choice([-1.0, 1.0], size=(6, 1))  # targets, shaped to broadcast
+
+    model = MLP([2, 5, 1], activation="tanh", seed=11)
+    params = model.parameters()
+    p = params[0]  # gradcheck the first parameter tensor (the first layer's W)
+    p0 = as_array(p).copy()
+
+    # Analytic grad from autodiff.
+    model.zero_grad() if hasattr(model, "zero_grad") else None
+    for q in params:
+        q.grad = np.zeros_like(as_array(q))
+    loss = mse_loss(model(Tensor(X)), yb)
+    loss.backward()
+    g_analytic = as_array(p.grad)
+
+    # Numeric grad: perturb p.data entrywise, recompute the forward loss only.
+    def loss_at(p_data):
+        p.data = np.asarray(p_data, dtype=float).reshape(p0.shape)
+        out = mse_loss(model(Tensor(X)), yb)
+        return float(as_array(out))
+
+    g_num = central_diff(loss_at, p0.copy())
+    p.data = p0  # restore
+
+    assert g_analytic.shape == g_num.shape, "grad shape must match param shape"
+    assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
+        "autodiff grad of batched mse_loss must match central differences:\n "
+        f"analytic=\n{g_analytic}\n numeric=\n{g_num}"
     )
-
-
-# ===========================================================================
-# AdamW
-# ===========================================================================
-def test_adamw_decouples_decay():
-    """AdamW(wd>0) ends closer to zero than Adam(wd=0) on a zero-gradient param.
-
-    With g = 0 the adaptive Adam step is ~0, so any shrinkage is purely the
-    decoupled decay term lr*wd*theta.
-    """
-    start = np.array([4.0, -4.0])
-
-    p_plain = Param(start.copy())
-    p_plain.grad = np.zeros(2)
-    Adam([p_plain], lr=1e-2, weight_decay=0.0).step()
-
-    p_wd = Param(start.copy())
-    p_wd.grad = np.zeros(2)
-    AdamW([p_wd], lr=1e-2, weight_decay=0.5).step()
-
-    assert np.all(np.abs(p_wd.data) < np.abs(p_plain.data)), (
-        "AdamW decoupled decay must shrink params toward zero vs plain Adam"
-    )
-
-
-def test_adamw_differs_from_coupled_adam():
-    """Decoupled (AdamW) and coupled (Adam wd) updates should not coincide."""
-    data = np.array([1.0, -2.0, 3.0])
-    grad = np.array([0.5, -1.0, 0.25])
-
-    p_w = Param(data.copy())
-    p_w.grad = grad.copy()
-    AdamW([p_w], lr=1e-2, weight_decay=0.1).step()
-
-    p_c = Param(data.copy())
-    p_c.grad = grad.copy()
-    Adam([p_c], lr=1e-2, weight_decay=0.1).step()
-
-    assert not np.allclose(p_w.data, p_c.data), (
-        "AdamW (decoupled) and Adam coupled weight decay should differ"
-    )
-
-
-# ===========================================================================
-# Convergence of all optimizers on a convex quadratic
-# ===========================================================================
-@pytest.mark.parametrize(
-    "make_opt,steps",
-    [
-        (lambda ps: Momentum(ps, lr=0.2, beta=0.9), 300),
-        (lambda ps: RMSProp(ps, lr=0.05), 800),
-        (lambda ps: Adam(ps, lr=0.1), 600),
-        (lambda ps: AdamW(ps, lr=0.1, weight_decay=0.0), 600),
-    ],
-)
-def test_all_optimizers_converge(make_opt, steps):
-    rng = np.random.default_rng(1)
-    p = Param(rng.uniform(-2, 2, size=8))
-    opt = make_opt([p])
-    for _ in range(steps):
-        set_grad_quadratic([p])
-        opt.step()
-    assert quadratic_loss([p.data]) < 1e-2, (
-        f"{type(opt).__name__} failed to minimize the convex quadratic"
-    )
-
-
-# ===========================================================================
-# Multiple parameters with independent state
-# ===========================================================================
-def test_independent_per_param_state():
-    """Each parameter must keep its own moment buffers (no shared state)."""
-    a = Param(np.array([1.0, 1.0]))
-    b = Param(np.array([10.0, 10.0, 10.0]))  # different shape on purpose
-    opt = Adam([a, b], lr=1e-2)
-    for _ in range(3):
-        a.grad = np.array([1.0, -1.0])
-        b.grad = np.array([2.0, 2.0, 2.0])
-        opt.step()
-    # Shapes preserved and both moved -> buffers were allocated per-parameter.
-    assert a.data.shape == (2,) and b.data.shape == (3,)
-    assert not np.allclose(a.data, [1.0, 1.0])
-    assert not np.allclose(b.data, [10.0, 10.0, 10.0])
