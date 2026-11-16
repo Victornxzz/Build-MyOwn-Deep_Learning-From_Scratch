@@ -7,7 +7,7 @@ from src.vec import Vec, Mat
 from src.tensor import Tensor
 from src.nn import Neuron, Dense, MLP
 from src.loss import mse_loss, mae_loss, log_softmax, softmax, cross_entropy_loss
-from src.optim import Optimizer, SGD
+from src.optim import Optimizer, SGD, SGDMomentum
 from src.trainer import accuracy, train, plot_history
 from src.init import (
     xavier_uniform,
@@ -22,29 +22,35 @@ EPS = 1e-6
 ATOL = 1e-6
 RTOL = 1e-4
 
+Momentum = SGDMomentum
 
-# --- helpers -----------------------------------------------------------------
+# --- Small helpers -----------------------------------------------------------
 def as_array(t):
-    """Underlying numpy array of a Tensor (or pass arrays straight through)."""
+    """Return the underlying numpy array of a Tensor (or pass arrays through)."""
     return np.asarray(t.data if hasattr(t, "data") else t, dtype=float)
 
 
-def make_tensor(arr, requires_grad=True):
-    """Build a Tensor, tolerating constructors with or without requires_grad."""
+def make_param(arr):
+    """Build a leaf parameter Tensor from a numpy array, tolerating ctor kwargs."""
     arr = np.asarray(arr, dtype=float)
     try:
-        return Tensor(arr, requires_grad=requires_grad)
+        return Tensor(arr, requires_grad=True)
     except TypeError:
         return Tensor(arr)
 
 
-def scalar_out(t):
-    """Reduce a Tensor's output to a python float (sum) for finite-diff probing."""
-    return float(np.sum(as_array(t)))
+def set_grad(p, g):
+    """Write gradient g into p.grad as a float64 array of matching shape."""
+    p.grad = np.asarray(g, dtype=float).reshape(as_array(p).shape)
+
+
+def make_momentum(params, lr, beta=0.9, nesterov=False):
+    """Construct Momentum, tolerating positional/keyword styles."""
+    return Momentum(params, lr, beta=beta, nesterov=nesterov)
 
 
 def central_diff(f, x, eps=EPS):
-    """Central-difference gradient of scalar-valued f at numpy point x."""
+    """Numerical gradient of scalar-valued f at numpy point x (any shape)."""
     x = np.asarray(x, dtype=float)
     grad = np.zeros_like(x)
     it = np.nditer(x, flags=["multi_index"])
@@ -61,244 +67,200 @@ def central_diff(f, x, eps=EPS):
     return grad
 
 
-def skip_if_unimplemented(fn, *args, **kwargs):
-    """Call fn; skip the test if it (or a dependency) is still a skeleton."""
-    try:
-        return fn(*args, **kwargs)
-    except NotImplementedError as exc:  # pragma: no cover
-        pytest.skip(f"depends on unimplemented code: {exc}")
+# --- A well-understood ill-conditioned quadratic -----------------------------
+def quad_problem():
+    """Return (A, b, x0) for f(x) = 0.5 x^T A x - b^T x, A SPD ill-conditioned."""
+    A = np.array([[20.0, 0.0], [0.0, 1.0]])  # condition number 20
+    b = np.array([2.0, 1.0])
+    x0 = np.array([3.0, 3.0])
+    return A, b, x0
 
 
-# ============================================================================
-# Initializer shapes
-# ============================================================================
-@pytest.mark.parametrize(
-    "fn", [xavier_uniform, xavier_normal, he_normal, he_uniform]
-)
-def test_init_shape(fn):
-    W = skip_if_unimplemented(fn, 7, 5, seed=0)
-    W = np.asarray(W)
-    assert W.shape == (7, 5), f"{fn.__name__} must return shape (n_in, n_out)"
-    assert W.dtype == np.float64, f"{fn.__name__} must return float64"
+def f_quad(x, A, b):
+    x = np.asarray(x, dtype=float)
+    return float(0.5 * x @ A @ x - b @ x)
 
 
-# ============================================================================
-# Reproducibility with a fixed seed
-# ============================================================================
-@pytest.mark.parametrize(
-    "fn", [xavier_uniform, xavier_normal, he_normal, he_uniform]
-)
-def test_init_reproducible(fn):
-    a = skip_if_unimplemented(fn, 16, 12, seed=42)
-    b = skip_if_unimplemented(fn, 16, 12, seed=42)
-    assert np.allclose(a, b), f"{fn.__name__}: same seed must give same weights"
-    c = skip_if_unimplemented(fn, 16, 12, seed=43)
-    assert not np.allclose(a, c), f"{fn.__name__}: different seed must differ"
+def quadratic_descent(optimizer_factory, x0, A, b, steps):
+    """Run ``steps`` optimizer updates on f(x) = 0.5 x^T A x - b^T x (A SPD).
+
+    Test harness, not part of the exercise: builds a leaf parameter from a
+    copy of ``x0``, feeds it the exact gradient ``A @ x - b`` each iteration
+    (no ``backward()`` needed), and returns the f(x) value after each step —
+    the loss curve the convergence tests compare across optimizers.
+    """
+    p = make_param(np.array(x0, dtype=float))
+    opt = optimizer_factory(p)
+    history = []
+    for _ in range(steps):
+        set_grad(p, A @ as_array(p) - b)
+        opt.step()
+        history.append(f_quad(as_array(p), A, b))
+    return history
 
 
-# ============================================================================
-# Empirical variance matches the derived target Var(W)
-# ============================================================================
-def test_xavier_variance_target():
-    n_in, n_out = 200, 300
-    target = 2.0 / (n_in + n_out)  # Var(W) for Xavier
-    Wu = skip_if_unimplemented(xavier_uniform, n_in, n_out, seed=0)
-    Wn = skip_if_unimplemented(xavier_normal, n_in, n_out, seed=0)
-    vu, vn = np.var(Wu), np.var(Wn)
-    assert np.isclose(vu, target, rtol=0.10), (
-        f"xavier_uniform var {vu:.3e} should match 2/(n_in+n_out)={target:.3e}"
-    )
-    assert np.isclose(vn, target, rtol=0.10), (
-        f"xavier_normal var {vn:.3e} should match 2/(n_in+n_out)={target:.3e}"
-    )
+# --- Construction ------------------------------------------------------------
+def test_velocity_buffers_initialized_to_zero():
+    p = make_param([1.0, 2.0, 3.0])
+    opt = make_momentum([p], lr=0.1, beta=0.9)
+    assert len(opt.velocities) == 1, "one velocity buffer per parameter"
+    assert np.allclose(opt.velocities[0], 0.0), "velocity must start at zero"
+    assert opt.velocities[0].shape == as_array(p).shape, "buffer shape == param"
 
 
-def test_he_variance_target():
-    n_in, n_out = 256, 128
-    target = 2.0 / n_in  # Var(W) for He/Kaiming
-    Wn = skip_if_unimplemented(he_normal, n_in, n_out, seed=0)
-    Wu = skip_if_unimplemented(he_uniform, n_in, n_out, seed=0)
-    vn, vu = np.var(Wn), np.var(Wu)
-    assert np.isclose(vn, target, rtol=0.10), (
-        f"he_normal var {vn:.3e} should match 2/n_in={target:.3e}"
-    )
-    assert np.isclose(vu, target, rtol=0.10), (
-        f"he_uniform var {vu:.3e} should match 2/n_in={target:.3e}"
-    )
+def test_invalid_beta_rejected():
+    p = make_param([1.0])
+    with pytest.raises((ValueError, AssertionError)):
+        make_momentum([p], lr=0.1, beta=1.0)
+    with pytest.raises((ValueError, AssertionError)):
+        make_momentum([p], lr=0.1, beta=-0.1)
 
 
-def test_xavier_gain_scales_variance():
-    n_in, n_out = 128, 128
-    base = skip_if_unimplemented(xavier_normal, n_in, n_out, gain=1.0, seed=1)
-    scaled = skip_if_unimplemented(xavier_normal, n_in, n_out, gain=2.0, seed=1)
-    # Variance scales with gain**2 -> std scales with gain.
-    assert np.isclose(np.std(scaled) / np.std(base), 2.0, rtol=0.10), (
-        "gain=2 should double the std of xavier_normal"
-    )
+def test_repr():
+    p = make_param([1.0])
+    r = repr(make_momentum([p], lr=0.1, beta=0.9))
+    assert "Momentum" in r and "0.9" in r
 
 
-def test_init_zero_mean():
-    W = skip_if_unimplemented(he_normal, 256, 256, seed=2)
-    assert abs(np.mean(W)) < 0.02, "He init should be (approximately) zero-mean"
+def test_param_update_uses_velocity():
+    """With a constant grad, p moves by -lr * v each step (heavy-ball)."""
+    p = make_param([0.0])
+    lr, beta = 0.1, 0.5
+    opt = make_momentum([p], lr=lr, beta=beta, nesterov=False)
+    g = np.array([2.0])
+
+    p_ref = np.array([0.0])
+    v_ref = np.array([0.0])
+    for _ in range(4):
+        set_grad(p, g)
+        opt.step()
+        v_ref = beta * v_ref + g
+        p_ref = p_ref - lr * v_ref
+        assert np.allclose(as_array(p), p_ref, atol=ATOL), (
+            f"param update mismatch: got={as_array(p)}, want={p_ref}"
+        )
 
 
-# ============================================================================
-# init_dense overwrites params in place but keeps the leaf Tensors
-# ============================================================================
-def test_init_dense_in_place():
-    layer = skip_if_unimplemented(Dense, 4, 3, bias=True, seed=0)
-    W_old = layer.W  # same object must survive
-    b_old = layer.b
-    newW = skip_if_unimplemented(he_normal, 4, 3, seed=7)
-    skip_if_unimplemented(init_dense, layer, newW, b=np.zeros(3))
-    assert layer.W is W_old, "init_dense must keep the SAME W Tensor object"
-    assert layer.b is b_old, "init_dense must keep the SAME b Tensor object"
-    assert np.allclose(as_array(layer.W), newW), "W.data must be overwritten"
-    assert np.allclose(as_array(layer.b), 0.0), "b.data must be overwritten to 0"
-    assert as_array(layer.W.grad).shape == newW.shape, "grad reset to W shape"
+def test_nesterov_update_rule():
+    """Nesterov: p -= lr * (g + beta * v) with v the post-update velocity."""
+    p = make_param([0.0, 0.0])
+    lr, beta = 0.05, 0.9
+    opt = make_momentum([p], lr=lr, beta=beta, nesterov=True)
+    grads = [np.array([1.0, 2.0]), np.array([-0.5, 1.0]), np.array([0.3, -0.7])]
+
+    p_ref = np.zeros(2)
+    v_ref = np.zeros(2)
+    for g in grads:
+        set_grad(p, g)
+        opt.step()
+        v_ref = beta * v_ref + g
+        p_ref = p_ref - lr * (g + beta * v_ref)
+        assert np.allclose(as_array(p), p_ref, atol=ATOL), (
+            f"nesterov update mismatch: got={as_array(p)}, want={p_ref}"
+        )
 
 
-def test_init_dense_shape_mismatch_raises():
-    layer = skip_if_unimplemented(Dense, 4, 3, bias=True, seed=0)
-    with pytest.raises(ValueError):
-        skip_if_unimplemented(init_dense, layer, np.zeros((4, 5)))
+# --- beta = 0 reduces to plain SGD ------------------------------------------
+def test_beta_zero_equals_plain_sgd():
+    """With beta=0, Momentum must match stage_14's SGD step-for-step."""
+    A, b, x0 = quad_problem()
+
+    p_m = make_param(x0)
+    opt_m = make_momentum([p_m], lr=0.01, beta=0.0)
+
+    p_s = make_param(x0)
+    opt_s = SGD([p_s], 0.01)
+
+    for _ in range(20):
+        g = A @ as_array(p_m) - b
+        set_grad(p_m, g)
+        opt_m.step()
+
+        g2 = A @ as_array(p_s) - b
+        set_grad(p_s, g2)
+        opt_s.step()
+
+        assert np.allclose(as_array(p_m), as_array(p_s), atol=ATOL), (
+            "beta=0 Momentum should equal plain SGD:\n "
+            f"momentum={as_array(p_m)}\n sgd={as_array(p_s)}"
+        )
 
 
-# ============================================================================
-# Activation-statistics harness: success and failure modes
-# ============================================================================
-def _stats(init_fn, activation, sizes=None, **kw):
-    if sizes is None:
-        sizes = [64] * 8
-    return skip_if_unimplemented(
-        forward_activation_stats, sizes, init_fn, activation,
-        n_samples=512, seed=0, **kw,
-    )
+# --- zero_grad / reset -------------------------------------------------------
+def test_zero_grad():
+    p = make_param([1.0, 2.0])
+    opt = make_momentum([p], lr=0.1, beta=0.9)
+    set_grad(p, [3.0, 4.0])
+    opt.zero_grad()
+    assert np.allclose(as_array(p.grad), 0.0), "zero_grad must clear p.grad"
 
 
-def test_stats_length_and_keys():
-    sizes = [32, 32, 32, 32]
-    stats = _stats(lambda i, o: xavier_normal(i, o, seed=0), "tanh", sizes=sizes)
-    assert len(stats) == len(sizes) - 1, "one stats dict per layer"
-    for d in stats:
-        for k in ("mean", "std", "saturated", "dead"):
-            assert k in d, f"each stats dict must contain key {k!r}"
+def test_reset_clears_velocity():
+    p = make_param([0.0])
+    opt = make_momentum([p], lr=0.1, beta=0.9)
+    set_grad(p, [1.0])
+    opt.step()
+    assert not np.allclose(opt.velocities[0], 0.0), "velocity should be nonzero"
+    opt.reset()
+    assert np.allclose(opt.velocities[0], 0.0), "reset must zero the velocity"
 
 
-def test_xavier_tanh_keeps_std_stable():
-    stats = _stats(lambda i, o: xavier_normal(i, o, seed=0), "tanh")
-    first, last = stats[0]["std"], stats[-1]["std"]
-    # Matched init: std should not collapse and not explode across depth.
-    assert last > 0.2 * first, (
-        f"Xavier+tanh std collapsed across depth: first={first:.3f} last={last:.3f}"
-    )
-    assert stats[-1]["saturated"] < 0.5, (
-        "Xavier+tanh should not saturate most units"
-    )
+# --- Convergence speed-up: momentum / Nesterov beat plain SGD ----------------
+def test_momentum_converges_faster_than_sgd():
+    A, b, x0 = quad_problem()
+    lr = 0.02
+    steps = 60
 
-
-def test_he_relu_keeps_signal_alive():
-    stats = _stats(lambda i, o: he_normal(i, o, seed=0), "relu")
-    first, last = stats[0]["std"], stats[-1]["std"]
-    assert last > 0.2 * first, (
-        f"He+relu std collapsed across depth: first={first:.3f} last={last:.3f}"
-    )
-
-
-def test_tiny_init_vanishes():
-    # Deliberately tiny weights: per-layer factor n_in*Var(W) << 1 -> std -> 0.
-    tiny = lambda i, o: np.random.default_rng(0).normal(0.0, 0.01, size=(i, o))
-    stats = _stats(tiny, "tanh")
-    assert stats[-1]["std"] < 0.1 * stats[0]["std"], (
-        "tiny init should make activation std vanish with depth"
+    hist_sgd = quadratic_descent(lambda p: SGD([p], lr), x0.copy(), A, b, steps)
+    hist_mom = quadratic_descent(
+        lambda p: make_momentum([p], lr, beta=0.9, nesterov=False),
+        x0.copy(), A, b, steps,
     )
 
-
-def test_large_tanh_saturates():
-    # Deliberately large weights push tanh into its flat tails.
-    big = lambda i, o: np.random.default_rng(0).normal(0.0, 1.0, size=(i, o))
-    stats = _stats(big, "tanh")
-    assert stats[-1]["saturated"] > 0.5, (
-        "large init should saturate most tanh units (|out| > 0.98)"
+    assert len(hist_sgd) == steps and len(hist_mom) == steps, (
+        "quadratic_descent must return one loss per step"
+    )
+    assert hist_mom[-1] < hist_sgd[-1] - 1e-9, (
+        "momentum should reach a lower final loss than SGD in equal steps:\n "
+        f"sgd_final={hist_sgd[-1]}, momentum_final={hist_mom[-1]}"
     )
 
 
-def test_large_relu_kills_units():
-    big = lambda i, o: np.random.default_rng(0).normal(0.0, 1.0, size=(i, o))
-    stats = _stats(big, "relu")
-    # With large symmetric weights ~ half of pre-activations are negative -> dead.
-    assert stats[-1]["dead"] > 0.3, (
-        "large init should leave a substantial dead-ReLU fraction"
+def test_nesterov_converges():
+    A, b, x0 = quad_problem()
+    lr = 0.02
+    steps = 60
+
+    hist_sgd = quadratic_descent(lambda p: SGD([p], lr), x0.copy(), A, b, steps)
+    hist_nag = quadratic_descent(
+        lambda p: make_momentum([p], lr, beta=0.9, nesterov=True),
+        x0.copy(), A, b, steps,
+    )
+    assert hist_nag[-1] < hist_sgd[-1] - 1e-9, (
+        "Nesterov should reach a lower final loss than SGD in equal steps:\n "
+        f"sgd_final={hist_sgd[-1]}, nesterov_final={hist_nag[-1]}"
     )
 
 
-# ============================================================================
-# A freshly initialized Dense still gradchecks (init != gradient)
-# ============================================================================
-def _make_inited_dense(init_fn, n_in, n_out, seed):
-    layer = Dense(n_in, n_out, bias=True, seed=seed)
-    init_dense(layer, init_fn(n_in, n_out, seed=seed), b=np.zeros(n_out))
-    return layer
-
-
-def test_gradcheck_wrt_W_after_init():
-    layer = skip_if_unimplemented(_make_inited_dense, he_normal, 4, 3, 0)
-    X = np.array([[0.7, -1.3, 0.2, 2.1], [1.0, 0.5, -0.5, 0.3]])
-
-    layer.zero_grad()
-    y = skip_if_unimplemented(layer, make_tensor(X, requires_grad=False))
-    y.backward()
-    g_analytic = as_array(layer.W.grad)
-
-    W0 = as_array(layer.W).copy()
-
-    def f(W):
-        layer.W.data = W.copy()
-        return scalar_out(layer(make_tensor(X, requires_grad=False)))
-
-    g_num = central_diff(f, W0)
-    layer.W.data = W0
-    assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
-        f"dL/dW mismatch after init:\n analytic={g_analytic}\n numeric ={g_num}"
+def test_loss_decreases_overall():
+    A, b, x0 = quad_problem()
+    start_loss = f_quad(x0, A, b)  # capture BEFORE running (x0 may be mutated)
+    hist = quadratic_descent(
+        lambda p: make_momentum([p], 0.02, beta=0.9), x0.copy(), A, b, 60
     )
+    assert hist[-1] < start_loss, "loss must drop below the starting value"
 
 
-def test_gradcheck_wrt_b_after_init():
-    layer = skip_if_unimplemented(_make_inited_dense, xavier_normal, 3, 4, 1)
-    X = np.array([[0.4, -0.9, 1.7], [0.2, 0.1, -0.3], [1.1, -1.0, 0.5]])
-
-    layer.zero_grad()
-    y = skip_if_unimplemented(layer, make_tensor(X, requires_grad=False))
-    y.backward()
-    g_analytic = as_array(layer.b.grad).reshape(-1)
-
-    b0 = as_array(layer.b).reshape(-1).copy()
-
-    def f(b):
-        layer.b.data = b.copy().reshape(np.asarray(layer.b.data).shape)
-        return scalar_out(layer(make_tensor(X, requires_grad=False)))
-
-    g_num = central_diff(f, b0)
-    layer.b.data = b0.reshape(np.asarray(layer.b.data).shape)
-    assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
-        f"dL/db mismatch after init: analytic={g_analytic}, numeric={g_num}"
-    )
-
-
-def test_gradcheck_wrt_X_after_init():
-    layer = skip_if_unimplemented(_make_inited_dense, he_normal, 4, 2, 2)
-    X0 = np.array([[0.3, -0.6, 1.2, -2.0]])
-
-    layer.zero_grad()
-    x = make_tensor(X0, requires_grad=True)
-    y = skip_if_unimplemented(layer, x)
-    y.backward()
-    g_analytic = as_array(x.grad)
-
-    def f(xv):
-        return scalar_out(layer(make_tensor(xv, requires_grad=False)))
-
-    g_num = central_diff(f, X0.copy())
-    assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
-        f"dL/dX mismatch after init:\n analytic={g_analytic}\n numeric ={g_num}"
-    )
+# --- gradcheck: the gradient fed to the optimizer matches central differences -
+def test_quadratic_gradient_matches_central_diff():
+    """grad f = A x - b must equal a central-difference gradient of f."""
+    A, b, _ = quad_problem()
+    rng = np.random.default_rng(0)
+    for _ in range(5):
+        x = rng.standard_normal(2)
+        g_analytic = A @ x - b
+        g_num = central_diff(lambda xv: f_quad(xv, A, b), x.copy())
+        assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
+            f"quadratic gradient mismatch:\n analytic={g_analytic}\n "
+            f"numeric ={g_num}"
+        )
