@@ -7,7 +7,7 @@ from src.vec import Vec, Mat
 from src.tensor import Tensor
 from src.nn import Neuron, Dense, MLP
 from src.loss import mse_loss, mae_loss, log_softmax, softmax, cross_entropy_loss
-from src.optim import Optimizer, SGD, SGDMomentum
+from src.optim import Optimizer, SGD, SGDMomentum, Adam, AdamW, RMSProp
 from src.trainer import accuracy, train, plot_history
 from src.init import (
     xavier_uniform,
@@ -24,33 +24,34 @@ RTOL = 1e-4
 
 Momentum = SGDMomentum
 
-# --- Small helpers -----------------------------------------------------------
-def as_array(t):
-    """Return the underlying numpy array of a Tensor (or pass arrays through)."""
-    return np.asarray(t.data if hasattr(t, "data") else t, dtype=float)
+# --- A minimal parameter object matching the Tensor .data/.grad contract -----
+class Param:
+    """Tiny stand-in for a leaf ``Tensor``: ``.data``/``.grad`` plus the two
+    hooks the stage_14 ``Optimizer`` contract touches (``shape``, ``zero_grad``)."""
+
+    def __init__(self, data):
+        self.data = np.asarray(data, dtype=float)
+        self.grad = np.zeros_like(self.data)
+
+    @property
+    def shape(self):
+        return self.data.shape
+
+    def zero_grad(self):
+        self.grad = np.zeros_like(self.data)
 
 
-def make_param(arr):
-    """Build a leaf parameter Tensor from a numpy array, tolerating ctor kwargs."""
-    arr = np.asarray(arr, dtype=float)
-    try:
-        return Tensor(arr, requires_grad=True)
-    except TypeError:
-        return Tensor(arr)
+def make_params(arrays):
+    return [Param(a) for a in arrays]
 
 
-def set_grad(p, g):
-    """Write gradient g into p.grad as a float64 array of matching shape."""
-    p.grad = np.asarray(g, dtype=float).reshape(as_array(p).shape)
-
-
-def make_momentum(params, lr, beta=0.9, nesterov=False):
-    """Construct Momentum, tolerating positional/keyword styles."""
-    return Momentum(params, lr, beta=beta, nesterov=nesterov)
+def quadratic_loss(thetas):
+    """L = 0.5 * sum(theta**2) over a list of arrays; grad is theta itself."""
+    return 0.5 * sum(float(np.sum(t ** 2)) for t in thetas)
 
 
 def central_diff(f, x, eps=EPS):
-    """Numerical gradient of scalar-valued f at numpy point x (any shape)."""
+    """Numerical gradient of scalar f at numpy point x (any shape)."""
     x = np.asarray(x, dtype=float)
     grad = np.zeros_like(x)
     it = np.nditer(x, flags=["multi_index"])
@@ -67,200 +68,300 @@ def central_diff(f, x, eps=EPS):
     return grad
 
 
-# --- A well-understood ill-conditioned quadratic -----------------------------
-def quad_problem():
-    """Return (A, b, x0) for f(x) = 0.5 x^T A x - b^T x, A SPD ill-conditioned."""
-    A = np.array([[20.0, 0.0], [0.0, 1.0]])  # condition number 20
-    b = np.array([2.0, 1.0])
-    x0 = np.array([3.0, 3.0])
-    return A, b, x0
+def set_grad_quadratic(params):
+    """Set p.grad = p.data for every param (gradient of 0.5*sum(theta**2))."""
+    for p in params:
+        p.grad = p.data.copy()
 
 
-def f_quad(x, A, b):
-    x = np.asarray(x, dtype=float)
-    return float(0.5 * x @ A @ x - b @ x)
+# ===========================================================================
+# Gradcheck: the gradient we feed the optimizer is the true gradient
+# ===========================================================================
+def test_quadratic_gradcheck():
+    """g = theta is the analytic gradient of 0.5*sum(theta**2); verify numerically."""
+    theta = np.array([0.7, -1.3, 0.2, 2.1])
+    g_analytic = theta.copy()  # what we feed the optimizer
+
+    def f(x):
+        return 0.5 * float(np.sum(x ** 2))
+
+    g_num = central_diff(f, theta.copy())
+    assert np.allclose(g_analytic, g_num, atol=1e-6, rtol=1e-5), (
+        f"quadratic gradient mismatch:\n analytic={g_analytic}\n numeric ={g_num}"
+    )
 
 
-def quadratic_descent(optimizer_factory, x0, A, b, steps):
-    """Run ``steps`` optimizer updates on f(x) = 0.5 x^T A x - b^T x (A SPD).
-
-    Test harness, not part of the exercise: builds a leaf parameter from a
-    copy of ``x0``, feeds it the exact gradient ``A @ x - b`` each iteration
-    (no ``backward()`` needed), and returns the f(x) value after each step —
-    the loss curve the convergence tests compare across optimizers.
-    """
-    p = make_param(np.array(x0, dtype=float))
-    opt = optimizer_factory(p)
-    history = []
-    for _ in range(steps):
-        set_grad(p, A @ as_array(p) - b)
-        opt.step()
-        history.append(f_quad(as_array(p), A, b))
-    return history
-
-
-# --- Construction ------------------------------------------------------------
-def test_velocity_buffers_initialized_to_zero():
-    p = make_param([1.0, 2.0, 3.0])
-    opt = make_momentum([p], lr=0.1, beta=0.9)
-    assert len(opt.velocities) == 1, "one velocity buffer per parameter"
-    assert np.allclose(opt.velocities[0], 0.0), "velocity must start at zero"
-    assert opt.velocities[0].shape == as_array(p).shape, "buffer shape == param"
-
-
-def test_invalid_beta_rejected():
-    p = make_param([1.0])
-    with pytest.raises((ValueError, AssertionError)):
-        make_momentum([p], lr=0.1, beta=1.0)
-    with pytest.raises((ValueError, AssertionError)):
-        make_momentum([p], lr=0.1, beta=-0.1)
-
-
-def test_repr():
-    p = make_param([1.0])
-    r = repr(make_momentum([p], lr=0.1, beta=0.9))
-    assert "Momentum" in r and "0.9" in r
-
-
-def test_param_update_uses_velocity():
-    """With a constant grad, p moves by -lr * v each step (heavy-ball)."""
-    p = make_param([0.0])
-    lr, beta = 0.1, 0.5
-    opt = make_momentum([p], lr=lr, beta=beta, nesterov=False)
-    g = np.array([2.0])
-
-    p_ref = np.array([0.0])
-    v_ref = np.array([0.0])
-    for _ in range(4):
-        set_grad(p, g)
-        opt.step()
-        v_ref = beta * v_ref + g
-        p_ref = p_ref - lr * v_ref
-        assert np.allclose(as_array(p), p_ref, atol=ATOL), (
-            f"param update mismatch: got={as_array(p)}, want={p_ref}"
-        )
-
-
-def test_nesterov_update_rule():
-    """Nesterov: p -= lr * (g + beta * v) with v the post-update velocity."""
-    p = make_param([0.0, 0.0])
-    lr, beta = 0.05, 0.9
-    opt = make_momentum([p], lr=lr, beta=beta, nesterov=True)
-    grads = [np.array([1.0, 2.0]), np.array([-0.5, 1.0]), np.array([0.3, -0.7])]
-
-    p_ref = np.zeros(2)
-    v_ref = np.zeros(2)
-    for g in grads:
-        set_grad(p, g)
-        opt.step()
-        v_ref = beta * v_ref + g
-        p_ref = p_ref - lr * (g + beta * v_ref)
-        assert np.allclose(as_array(p), p_ref, atol=ATOL), (
-            f"nesterov update mismatch: got={as_array(p)}, want={p_ref}"
-        )
-
-
-# --- beta = 0 reduces to plain SGD ------------------------------------------
-def test_beta_zero_equals_plain_sgd():
-    """With beta=0, Momentum must match stage_14's SGD step-for-step."""
-    A, b, x0 = quad_problem()
-
-    p_m = make_param(x0)
-    opt_m = make_momentum([p_m], lr=0.01, beta=0.0)
-
-    p_s = make_param(x0)
-    opt_s = SGD([p_s], 0.01)
-
-    for _ in range(20):
-        g = A @ as_array(p_m) - b
-        set_grad(p_m, g)
-        opt_m.step()
-
-        g2 = A @ as_array(p_s) - b
-        set_grad(p_s, g2)
-        opt_s.step()
-
-        assert np.allclose(as_array(p_m), as_array(p_s), atol=ATOL), (
-            "beta=0 Momentum should equal plain SGD:\n "
-            f"momentum={as_array(p_m)}\n sgd={as_array(p_s)}"
-        )
-
-
-# --- zero_grad / reset -------------------------------------------------------
-def test_zero_grad():
-    p = make_param([1.0, 2.0])
-    opt = make_momentum([p], lr=0.1, beta=0.9)
-    set_grad(p, [3.0, 4.0])
+# ===========================================================================
+# Base API
+# ===========================================================================
+def test_zero_grad_clears():
+    params = make_params([np.array([1.0, 2.0]), np.array([[3.0]])])
+    for p in params:
+        p.grad = np.ones_like(p.data) * 5.0
+    opt = SGD(params, lr=0.1)
     opt.zero_grad()
-    assert np.allclose(as_array(p.grad), 0.0), "zero_grad must clear p.grad"
+    for p in params:
+        assert np.allclose(p.grad, 0.0), "zero_grad must clear every p.grad"
+        assert p.grad.shape == p.data.shape, "grad shape must match data shape"
 
 
-def test_reset_clears_velocity():
-    p = make_param([0.0])
-    opt = make_momentum([p], lr=0.1, beta=0.9)
-    set_grad(p, [1.0])
-    opt.step()
-    assert not np.allclose(opt.velocities[0], 0.0), "velocity should be nonzero"
-    opt.reset()
-    assert np.allclose(opt.velocities[0], 0.0), "reset must zero the velocity"
+def test_base_step_not_implemented():
+    params = make_params([np.array([1.0])])
+    base = Optimizer(params)
+    with pytest.raises(NotImplementedError):
+        base.step()
 
 
-# --- Convergence speed-up: momentum / Nesterov beat plain SGD ----------------
-def test_momentum_converges_faster_than_sgd():
-    A, b, x0 = quad_problem()
-    lr = 0.02
-    steps = 60
-
-    hist_sgd = quadratic_descent(lambda p: SGD([p], lr), x0.copy(), A, b, steps)
-    hist_mom = quadratic_descent(
-        lambda p: make_momentum([p], lr, beta=0.9, nesterov=False),
-        x0.copy(), A, b, steps,
-    )
-
-    assert len(hist_sgd) == steps and len(hist_mom) == steps, (
-        "quadratic_descent must return one loss per step"
-    )
-    assert hist_mom[-1] < hist_sgd[-1] - 1e-9, (
-        "momentum should reach a lower final loss than SGD in equal steps:\n "
-        f"sgd_final={hist_sgd[-1]}, momentum_final={hist_mom[-1]}"
-    )
+def test_step_leaves_grad_untouched():
+    params = make_params([np.array([1.0, -2.0, 3.0])])
+    set_grad_quadratic(params)
+    saved = params[0].grad.copy()
+    Adam(params, lr=1e-3).step()
+    assert np.allclose(params[0].grad, saved), "step() must not modify p.grad"
 
 
-def test_nesterov_converges():
-    A, b, x0 = quad_problem()
-    lr = 0.02
-    steps = 60
-
-    hist_sgd = quadratic_descent(lambda p: SGD([p], lr), x0.copy(), A, b, steps)
-    hist_nag = quadratic_descent(
-        lambda p: make_momentum([p], lr, beta=0.9, nesterov=True),
-        x0.copy(), A, b, steps,
-    )
-    assert hist_nag[-1] < hist_sgd[-1] - 1e-9, (
-        "Nesterov should reach a lower final loss than SGD in equal steps:\n "
-        f"sgd_final={hist_sgd[-1]}, nesterov_final={hist_nag[-1]}"
+# ===========================================================================
+# SGD / Momentum (imported from stage_14 / stage_17, used here unchanged)
+# ===========================================================================
+def test_sgd_plain_step():
+    """stage_14 SGD is exactly p.data -= lr * p.grad."""
+    lr = 0.05
+    data = np.array([1.0, -2.0, 3.0])
+    grad = np.array([0.5, 0.5, -1.0])
+    p = Param(data.copy())
+    p.grad = grad.copy()
+    SGD([p], lr=lr).step()
+    assert np.allclose(p.data, data - lr * grad), (
+        "plain SGD must be exactly p.data -= lr*p.grad"
     )
 
 
-def test_loss_decreases_overall():
-    A, b, x0 = quad_problem()
-    start_loss = f_quad(x0, A, b)  # capture BEFORE running (x0 may be mutated)
-    hist = quadratic_descent(
-        lambda p: make_momentum([p], 0.02, beta=0.9), x0.copy(), A, b, 60
-    )
-    assert hist[-1] < start_loss, "loss must drop below the starting value"
+def test_momentum_accumulates():
+    """stage_17 Momentum: velocity grows as g, g(1+b), g(1+b+b^2), ..."""
+    lr, b = 0.1, 0.9
+    g = np.array([1.0, -2.0])
+    p = Param(np.zeros(2))
+    opt = Momentum([p], lr=lr, beta=b)
 
-
-# --- gradcheck: the gradient fed to the optimizer matches central differences -
-def test_quadratic_gradient_matches_central_diff():
-    """grad f = A x - b must equal a central-difference gradient of f."""
-    A, b, _ = quad_problem()
-    rng = np.random.default_rng(0)
+    v = np.zeros(2)
+    theta = p.data.copy()
     for _ in range(5):
-        x = rng.standard_normal(2)
-        g_analytic = A @ x - b
-        g_num = central_diff(lambda xv: f_quad(xv, A, b), x.copy())
-        assert np.allclose(g_analytic, g_num, atol=ATOL, rtol=RTOL), (
-            f"quadratic gradient mismatch:\n analytic={g_analytic}\n "
-            f"numeric ={g_num}"
+        p.grad = g.copy()
+        opt.step()
+        v = b * v + g
+        theta = theta - lr * v
+        assert np.allclose(p.data, theta, atol=ATOL), (
+            "Momentum velocity update mismatch"
         )
+
+
+# ===========================================================================
+# RMSProp
+# ===========================================================================
+def test_rmsprop_reference_update():
+    lr, beta, eps = 0.01, 0.99, 1e-8
+    data = np.array([1.0, -2.0, 0.5])
+    grad = np.array([0.3, -0.7, 2.0])
+    p = Param(data.copy())
+    p.grad = grad.copy()
+    RMSProp([p], lr=lr, beta=beta, eps=eps).step()
+
+    v = (1 - beta) * grad ** 2
+    expected = data - lr * grad / (np.sqrt(v) + eps)
+    assert np.allclose(p.data, expected, atol=ATOL), (
+        f"RMSProp update mismatch:\n got     ={p.data}\n expected={expected}"
+    )
+
+
+# ===========================================================================
+# Adam
+# ===========================================================================
+def test_adam_step_counter():
+    p = Param(np.array([1.0]))
+    opt = Adam([p], lr=1e-3)
+    assert opt.t == 0, "Adam.t must start at 0"
+    p.grad = np.array([1.0])
+    opt.step()
+    assert opt.t == 1, "first step() must make t == 1"
+    opt.step()
+    assert opt.t == 2, "t must increment each step"
+
+
+def test_adam_reference_first_step():
+    """One Adam step from m=v=0 against a hand-computed reference."""
+    lr = 1e-3
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    data = np.array([1.0, -2.0, 3.0])
+    grad = np.array([0.5, -1.5, 0.25])
+    p = Param(data.copy())
+    p.grad = grad.copy()
+
+    Adam([p], lr=lr, betas=(b1, b2), eps=eps).step()
+
+    m = (1 - b1) * grad
+    v = (1 - b2) * grad ** 2
+    m_hat = m / (1 - b1 ** 1)
+    v_hat = v / (1 - b2 ** 1)
+    expected = data - lr * m_hat / (np.sqrt(v_hat) + eps)
+    assert np.allclose(p.data, expected, atol=ATOL), (
+        f"Adam first-step mismatch:\n got     ={p.data}\n expected={expected}"
+    )
+
+
+def test_adam_reference_two_steps():
+    """Two Adam steps with changing gradients; checks the EMA carry-over."""
+    lr, b1, b2, eps = 1e-2, 0.9, 0.999, 1e-8
+    data = np.array([0.5, -0.5])
+    g1 = np.array([1.0, -2.0])
+    g2 = np.array([0.5, 0.5])
+    p = Param(data.copy())
+    opt = Adam([p], lr=lr, betas=(b1, b2), eps=eps)
+
+    m = np.zeros(2)
+    v = np.zeros(2)
+    theta = data.copy()
+    for t, g in enumerate([g1, g2], start=1):
+        p.grad = g.copy()
+        opt.step()
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g ** 2
+        m_hat = m / (1 - b1 ** t)
+        v_hat = v / (1 - b2 ** t)
+        theta = theta - lr * m_hat / (np.sqrt(v_hat) + eps)
+        assert np.allclose(p.data, theta, atol=ATOL), (
+            f"Adam multi-step mismatch at t={t}:\n got={p.data}\n exp={theta}"
+        )
+
+
+def test_adam_betas_zero_is_signed_step():
+    """betas=(0,0): m_hat=g, v_hat=g**2 -> update ~ -lr*sign(g) (eps tiny)."""
+    lr = 1e-2
+    grad = np.array([2.0, -5.0, 0.1])
+    p = Param(np.zeros(3))
+    p.grad = grad.copy()
+    Adam([p], lr=lr, betas=(0.0, 0.0), eps=1e-12).step()
+    expected = -lr * np.sign(grad)
+    assert np.allclose(p.data, expected, atol=1e-6), (
+        f"Adam betas=(0,0) must give a signed step:\n got={p.data}\n exp={expected}"
+    )
+
+
+def test_adam_bias_correction_constant_grad():
+    """With a constant gradient g, the bias-corrected m_hat equals g exactly.
+
+    Unrolling m_t = (1-b1) sum b1^{t-i} g = g (1 - b1^t); dividing by (1-b1^t)
+    recovers g. We reconstruct m_hat from internal buffers if exposed; otherwise
+    we verify the resulting step has magnitude ~ lr (since m_hat/sqrt(v_hat) ~ 1).
+    """
+    lr, b1, b2, eps = 1e-3, 0.9, 0.999, 1e-8
+    g = np.array([3.0])
+    p = Param(np.array([0.0]))
+    opt = Adam([p], lr=lr, betas=(b1, b2), eps=eps)
+
+    prev = p.data.copy()
+    for t in range(1, 6):
+        p.grad = g.copy()
+        opt.step()
+        step_mag = abs(float((p.data - prev).item()))
+        prev = p.data.copy()
+        # For constant grad, m_hat -> g and v_hat -> g**2, so the step magnitude
+        # approaches lr * |g| / |g| = lr from the very first step.
+        assert abs(step_mag - lr) < 5e-4, (
+            f"bias-corrected Adam step at t={t} should be ~lr={lr}, got {step_mag}"
+        )
+
+
+def test_adam_converges_on_quadratic():
+    rng = np.random.default_rng(0)
+    p = Param(rng.uniform(-3, 3, size=10))
+    opt = Adam([p], lr=0.1)
+    for _ in range(500):
+        set_grad_quadratic([p])
+        opt.step()
+    assert quadratic_loss([p.data]) < 1e-3, (
+        "Adam should drive the convex quadratic loss near zero"
+    )
+
+
+# ===========================================================================
+# AdamW
+# ===========================================================================
+def test_adamw_decouples_decay():
+    """AdamW(wd>0) ends closer to zero than Adam(wd=0) on a zero-gradient param.
+
+    With g = 0 the adaptive Adam step is ~0, so any shrinkage is purely the
+    decoupled decay term lr*wd*theta.
+    """
+    start = np.array([4.0, -4.0])
+
+    p_plain = Param(start.copy())
+    p_plain.grad = np.zeros(2)
+    Adam([p_plain], lr=1e-2, weight_decay=0.0).step()
+
+    p_wd = Param(start.copy())
+    p_wd.grad = np.zeros(2)
+    AdamW([p_wd], lr=1e-2, weight_decay=0.5).step()
+
+    assert np.all(np.abs(p_wd.data) < np.abs(p_plain.data)), (
+        "AdamW decoupled decay must shrink params toward zero vs plain Adam"
+    )
+
+
+def test_adamw_differs_from_coupled_adam():
+    """Decoupled (AdamW) and coupled (Adam wd) updates should not coincide."""
+    data = np.array([1.0, -2.0, 3.0])
+    grad = np.array([0.5, -1.0, 0.25])
+
+    p_w = Param(data.copy())
+    p_w.grad = grad.copy()
+    AdamW([p_w], lr=1e-2, weight_decay=0.1).step()
+
+    p_c = Param(data.copy())
+    p_c.grad = grad.copy()
+    Adam([p_c], lr=1e-2, weight_decay=0.1).step()
+
+    assert not np.allclose(p_w.data, p_c.data), (
+        "AdamW (decoupled) and Adam coupled weight decay should differ"
+    )
+
+
+# ===========================================================================
+# Convergence of all optimizers on a convex quadratic
+# ===========================================================================
+@pytest.mark.parametrize(
+    "make_opt,steps",
+    [
+        (lambda ps: Momentum(ps, lr=0.2, beta=0.9), 300),
+        (lambda ps: RMSProp(ps, lr=0.05), 800),
+        (lambda ps: Adam(ps, lr=0.1), 600),
+        (lambda ps: AdamW(ps, lr=0.1, weight_decay=0.0), 600),
+    ],
+)
+def test_all_optimizers_converge(make_opt, steps):
+    rng = np.random.default_rng(1)
+    p = Param(rng.uniform(-2, 2, size=8))
+    opt = make_opt([p])
+    for _ in range(steps):
+        set_grad_quadratic([p])
+        opt.step()
+    assert quadratic_loss([p.data]) < 1e-2, (
+        f"{type(opt).__name__} failed to minimize the convex quadratic"
+    )
+
+
+# ===========================================================================
+# Multiple parameters with independent state
+# ===========================================================================
+def test_independent_per_param_state():
+    """Each parameter must keep its own moment buffers (no shared state)."""
+    a = Param(np.array([1.0, 1.0]))
+    b = Param(np.array([10.0, 10.0, 10.0]))  # different shape on purpose
+    opt = Adam([a, b], lr=1e-2)
+    for _ in range(3):
+        a.grad = np.array([1.0, -1.0])
+        b.grad = np.array([2.0, 2.0, 2.0])
+        opt.step()
+    # Shapes preserved and both moved -> buffers were allocated per-parameter.
+    assert a.data.shape == (2,) and b.data.shape == (3,)
+    assert not np.allclose(a.data, [1.0, 1.0])
+    assert not np.allclose(b.data, [10.0, 10.0, 10.0])
